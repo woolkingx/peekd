@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>peekd — network monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; background: #0d1117; color: #c9d1d9; font-size: 13px; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; }
+header h1 { font-size: 16px; color: #58a6ff; }
+select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px; }
+.stats { display: flex; gap: 12px; padding: 12px 20px; border-bottom: 1px solid #30363d; }
+.stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 16px; min-width: 120px; }
+.stat-label { color: #8b949e; font-size: 11px; margin-bottom: 4px; }
+.stat-value { font-size: 18px; color: #58a6ff; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px 20px; }
+.panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; }
+.panel h2 { font-size: 13px; color: #8b949e; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+canvas { max-height: 240px; }
+.full { grid-column: 1 / -1; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: #8b949e; font-weight: normal; padding: 4px 8px; border-bottom: 1px solid #21262d; font-size: 11px; text-transform: uppercase; }
+td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
+td.num, th.num { text-align: right; }
+td.num { color: #8b949e; }
+.dest-raddr { color: #58a6ff; }
+.dest-domain { color: #8b949e; font-size: 11px; }
+details summary { cursor: pointer; color: #8b949e; font-size: 11px; margin-top: 2px; }
+details td { color: #6e7681; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>peekd</h1>
+  <label>since
+    <select id="since" onchange="reload()">
+      <option value="1h">1h</option>
+      <option value="24h" selected>24h</option>
+      <option value="7d">7d</option>
+      <option value="30d">30d</option>
+    </select>
+  </label>
+  <label>group by
+    <select id="dim" onchange="reloadData()">
+      <option value="exe" selected>exe</option>
+      <option value="name">name</option>
+      <option value="domain">domain</option>
+      <option value="raddr">raddr</option>
+      <option value="rport">rport</option>
+      <option value="uid">uid</option>
+    </select>
+  </label>
+  <span id="updated" style="color:#6e7681;margin-left:auto;font-size:11px;"></span>
+</header>
+
+<div class="stats">
+  <div class="stat"><div class="stat-label">flows</div><div class="stat-value" id="s-flows">—</div></div>
+  <div class="stat"><div class="stat-label">sent</div><div class="stat-value" id="s-send">—</div></div>
+  <div class="stat"><div class="stat-label">recv</div><div class="stat-value" id="s-recv">—</div></div>
+  <div class="stat"><div class="stat-label">unique IPs</div><div class="stat-value" id="s-ips">—</div></div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Hourly flows</h2>
+    <canvas id="hourChart"></canvas>
+  </div>
+  <div class="panel">
+    <h2>Top by <span id="dim-label">exe</span></h2>
+    <canvas id="barChart"></canvas>
+  </div>
+  <div class="panel full">
+    <h2>All destinations</h2>
+    <div style="max-height:480px;overflow-y:auto">
+    <table id="topTable">
+      <thead style="position:sticky;top:0;background:#161b22"><tr><th>destination</th><th style="text-align:right;padding:4px 8px">flows</th><th style="text-align:right;padding:4px 8px">sent</th><th style="text-align:right;padding:4px 8px">recv</th><th style="text-align:right;padding:4px 8px">total</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const fmt = b => {
+  if (b >= 1e9) return (b/1e9).toFixed(1)+'G';
+  if (b >= 1e6) return (b/1e6).toFixed(1)+'M';
+  if (b >= 1e3) return (b/1e3).toFixed(1)+'K';
+  return b+'B';
+};
+
+let hourChart, barChart;
+
+const chartOpts = (label, color) => ({
+  responsive: true,
+  maintainAspectRatio: true,
+  plugins: { legend: { display: false } },
+  scales: {
+    x: { ticks: { color: '#8b949e', font: { family: 'monospace', size: 11 } }, grid: { color: '#21262d' } },
+    y: { ticks: { color: '#8b949e', font: { family: 'monospace', size: 11 }, callback: v => fmt(v) }, grid: { color: '#21262d' } }
+  }
+});
+
+function initCharts() {
+  hourChart = new Chart(document.getElementById('hourChart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'flows', data: [], backgroundColor: '#1f6feb' }] },
+    options: chartOpts('flows', '#1f6feb')
+  });
+  barChart = new Chart(document.getElementById('barChart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'bytes', data: [], backgroundColor: '#388bfd' }] },
+    options: chartOpts('bytes', '#388bfd')
+  });
+}
+
+async function loadSummary(since) {
+  const r = await fetch(`/api/summary?since=${since}`);
+  const d = await r.json();
+  document.getElementById('s-flows').textContent = d.flows.toLocaleString();
+  document.getElementById('s-send').textContent = fmt(d.send);
+  document.getElementById('s-recv').textContent = fmt(d.recv);
+  document.getElementById('s-ips').textContent = d.unique_ips.toLocaleString();
+
+  const labels = d.hours.map(h => h.hour + ':00');
+  const flows  = d.hours.map(h => h.flows);
+  hourChart.data.labels = labels;
+  hourChart.data.datasets[0].data = flows;
+  hourChart.update();
+}
+
+async function loadData(since, dim) {
+  document.getElementById('dim-label').textContent = dim;
+  const r = await fetch(`/api/data?since=${since}&dim=${dim}`);
+  const d = await r.json();
+  const top = d.rows.slice(0, 15);
+  const fullLabels = top.map(r => r.label);
+  barChart.data.labels = top.map((_, i) => i + 1);
+  barChart.data.datasets[0].data = top.map(r => r.send + r.recv);
+  barChart.options.plugins.tooltip = {
+    callbacks: {
+      title: items => fullLabels[items[0].dataIndex],
+      label: items => fmt(items.raw)
+    }
+  };
+  barChart.update();
+}
+
+async function loadTop(since) {
+  const r = await fetch(`/api/top?since=${since}`);
+  const d = await r.json();
+  const tbody = document.querySelector('#topTable tbody');
+  tbody.innerHTML = '';
+  for (const dest of d.dests) {
+    const h = dest.hostname || dest.domain;
+    const label = h ? `<span class="dest-raddr">${dest.raddr}</span> <span class="dest-domain">(${h})</span>`
+                    : `<span class="dest-raddr">${dest.raddr}</span>`;
+    const subRows = dest.subs.map(s =>
+      `<tr>
+        <td style="padding-left:16px;color:#6e7681;white-space:nowrap">:${s.rport}&nbsp;&nbsp;${s.name || '?'} uid=${s.uid}</td>
+        <td class="num" style="color:#6e7681">${s.flows}</td>
+        <td class="num" style="color:#6e7681">${fmt(s.send)}</td>
+        <td class="num" style="color:#6e7681">${fmt(s.recv)}</td>
+        <td class="num" style="color:#6e7681">${fmt(s.send+s.recv)}</td>
+      </tr>`
+    ).join('');
+    tbody.innerHTML += `
+      <tr>
+        <td>
+          ${label}
+          ${dest.subs.length ? `<details><summary style="color:#6e7681;font-size:11px;cursor:pointer">${dest.subs.length} processes</summary><table>${subRows}</table></details>` : ''}
+        </td>
+        <td class="num">${dest.flows}</td>
+        <td class="num">${fmt(dest.send)}</td>
+        <td class="num">${fmt(dest.recv)}</td>
+        <td class="num">${fmt(dest.send+dest.recv)}</td>
+      </tr>`;
+  }
+}
+
+async function reloadData() {
+  const since = document.getElementById('since').value;
+  const dim   = document.getElementById('dim').value;
+  await loadData(since, dim);
+}
+
+async function reload() {
+  const since = document.getElementById('since').value;
+  const dim   = document.getElementById('dim').value;
+  await Promise.all([loadSummary(since), loadData(since, dim), loadTop(since)]);
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+initCharts();
+reload();
+setInterval(reload, 30000);
+</script>
+</body>
+</html>
