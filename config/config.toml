@@ -1,0 +1,20 @@
+[database]
+enabled = true
+retention_days = 30
+write_limit_seconds = 5
+
+[monitoring]
+every_exe = false
+
+[log]
+ignore_ports = [53]
+ignore_domains = ["localhost"]
+ignore_networks = ["127.0.0.0/8", "::1/128"]
+
+[metrics]
+enabled = true
+interval_seconds = 60
+
+[web]
+enabled = false
+port = 5100

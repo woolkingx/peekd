@@ -1,0 +1,15 @@
+# Alert rules for peekd
+# Reload without restart: kill -HUP $(pidof peekd)
+
+# [[alerts]]
+# name = "curl-outbound"
+# exe = "/usr/bin/curl"
+# rport = 443
+# action = "exec"
+# exec = "logger 'peekd: {exe} → {raddr}:{rport} ({domain})'"
+
+# [[alerts]]
+# name = "binary-tampered"
+# on_new_hash = true
+# action = "exec"
+# exec = "logger 'peekd: binary tampered: {exe} sha256={sha256}'"
