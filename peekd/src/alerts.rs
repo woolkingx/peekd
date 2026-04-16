@@ -148,11 +148,27 @@ fn _expand_template(template: &str, event: &BpfEvent) -> String {
         .replace("{sha256}", &event.sha256)
 }
 
-async fn _exec_action(cmd: &str) {
+async fn _exec_action(cmd: &str, writer_tx: std::sync::mpsc::Sender<crate::storage::WriterMsg>, event: &BpfEvent, rule_name: &str, action_name: &str) {
     match tokio::process::Command::new("sh").arg("-c").arg(cmd).spawn() {
         Ok(mut child) => {
+            let writer_tx_clone = writer_tx.clone();
+            let event_clone = event.clone();
+            let rule_name_clone = rule_name.to_string();
+            let action_name_clone = action_name.to_string();
             tokio::spawn(async move {
                 let _ = child.wait().await;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                let _ = writer_tx_clone.send(crate::storage::WriterMsg::AlertEvent {
+                    ts,
+                    rule: rule_name_clone,
+                    exe: event_clone.exe.clone(),
+                    raddr: event_clone.raddr.to_string(),
+                    domain: event_clone.domain.clone(),
+                    action: action_name_clone,
+                });
             });
         }
         Err(e) => error!("alert exec spawn failed: {}", e),
@@ -222,11 +238,13 @@ pub async fn reload_shared_rules(shared: &SharedRules) {
 /// Consumes BpfEvent from broadcast channel, evaluates against alert rules,
 /// and executes scripts or webhooks for matching rules with deduplication.
 /// Rules are hot-reloadable via `shared_rules` handle (updated on SIGHUP).
+/// Sends AlertEvent messages to storage writer for audit logging.
 pub async fn run(
     mut rx: tokio::sync::broadcast::Receiver<BpfEvent>,
     _config: Arc<Config>,
     shared_rules: SharedRules,
     metrics: Arc<crate::metrics::Metrics>,
+    writer_tx: std::sync::mpsc::Sender<crate::storage::WriterMsg>,
 ) {
     // Deduplication window: (rule_name, exe, raddr_string, rport, uid) -> last_fired
     // uid included to prevent privilege-escalation bypass (different uid = different dedup slot)
@@ -276,11 +294,13 @@ pub async fn run(
                     // Matching + dedup stay in the main loop (need mutable dedup_window).
                     let action = rule.action.clone();
                     let event_clone = event.clone();
+                    let rule_name_clone = rule.name.clone();
+                    let writer_tx_clone = writer_tx.clone();
                     tokio::spawn(async move {
                         match &action {
                             AlertAction::Exec(template) => {
                                 let cmd = _expand_template(template, &event_clone);
-                                _exec_action(&cmd).await;
+                                _exec_action(&cmd, writer_tx_clone, &event_clone, &rule_name_clone, "exec").await;
                             }
                             AlertAction::Webhook { url, method } => {
                                 _webhook_action(url, method, &event_clone).await;

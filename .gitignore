@@ -4,3 +4,6 @@ peekd-ebpf/target
 .cleanup/
 docs/
 scripts/
+
+plan-web2.md
+plan/

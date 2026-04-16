@@ -103,10 +103,15 @@ peekd status
 Open `http://localhost:5100` after starting with `--web-port` or `peekd web`.
 
 Features:
-- Hourly/daily traffic charts (send + recv)
+- Time range picker with date pickers, auto-refresh, group-by toggle
+- Hourly/daily traffic charts (send + recv) with auto bucket granularity
 - Top destinations by remote port (bar chart)
 - Full destination table with hostname resolution and per-process breakdown
-- Time window selector (1h / 6h / 24h / 7d)
+- Connection timeline slide-in panel, process tree view, connection detail drill-down
+- Alert log panel, bytes over time stacked bar chart
+- Inline column filter, URL hash permalink
+- Ignore UI (`ignore_extra.toml` hot-reload)
+- CSV export (`/api/export`)
 
 Hostname resolution order: system PTR lookup (`/etc/resolv.conf`) → whois org lookup for public IPs.
 
@@ -116,25 +121,37 @@ Hostname resolution order: system PTR lookup (`/etc/resolv.conf`) → whois org 
 
 ```toml
 [database]
-enabled = true
-retention_days = 30
+enabled             = true
+retention_days      = 30
 write_limit_seconds = 5
+text_log            = false  # also write new-exe events to /var/log/peekd/exe.log
 
 [monitoring]
-every_exe = false          # track exec events even without network activity
+every_exe = false  # track exec events even without network activity
 
 [log]
-ignore_ports = [53]
+ignore_ports   = [53]
 ignore_domains = ["localhost"]
-ignore_networks = ["127.0.0.0/8", "::1/128"]
+ignore_ips     = ["127.0.0.0/8", "::1/128"]  # replaces ignore_networks
+ignore_sha256  = []
 
 [metrics]
-enabled = true
-interval_seconds = 60
+interval_seconds = 30
+
+[broadcast]
+channel_capacity = 10000
+
+[desktop]
+user          = "root"
+notifications = true
 
 [web]
-enabled = false
-port = 5100
+enabled         = false
+port            = 5100
+bind            = "127.0.0.1"  # "0.0.0.0" exposes on LAN (no auth)
+refresh_seconds = 30
+default_since   = "24h"
+top_limit       = 200
 ```
 
 Alert rules at `/etc/peekd/alerts.toml`:

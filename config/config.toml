@@ -1,25 +1,50 @@
+# peekd configuration — /etc/peekd/config.toml
+# All fields are optional; shown values are defaults.
+
 [database]
-enabled = true
-retention_days = 30
-write_limit_seconds = 5
+enabled             = true
+retention_days      = 30     # days to keep traffic/exe records (min 1)
+write_limit_seconds = 5      # deduplicate same traffic row within N seconds
+text_log            = false  # also write new-exe events to /var/log/peekd/exe.log
 
 [monitoring]
-every_exe = false
+every_exe              = false  # log every exec, not just new exe paths
+perf_ring_buffer_pages = 256   # eBPF ring buffer size in pages (power of 2)
+# st_dev_mask          = 0xfffff  # device major mask for inode filtering
+fd_cache_size          = 10000  # per-process fd→path LRU cache size
 
 [log]
+addresses = true  # record remote IP addresses
+commands  = true  # record full cmdline
+ports     = true  # record local/remote ports
+
+# Ports to suppress (e.g. DNS noise)
 ignore_ports = [53]
+
+# Domain suffixes to suppress (suffix match)
 ignore_domains = ["localhost"]
-ignore_networks = ["127.0.0.0/8", "::1/128"]
+
+# CIDRs to suppress — IPv4 and IPv6 CIDR notation
+ignore_ips = ["127.0.0.0/8", "::1/128"]
+
+# SHA-256 hex digests of executables to suppress
+ignore_sha256 = []
 
 [metrics]
-enabled = true
-interval_seconds = 60
+interval_seconds = 30  # write /run/peekd/metrics.json every N seconds
+
+[broadcast]
+channel_capacity = 10000  # internal event fan-out channel buffer size
+
+[desktop]
+user          = "root"  # run desktop notifications as this user
+notifications = true    # enable libnotify desktop notifications
 
 [web]
-enabled = true
-port = 5100
-bind = "0.0.0.0"         # set to "127.0.0.1" to restrict to localhost
-top_limit = 200           # max destinations shown in /api/top
-static_dir = ""           # "" = embedded HTML; path = serve from disk
-refresh_seconds = 30      # dashboard auto-refresh interval
-default_since = "24h"     # default time range on page load
+enabled         = false         # enable embedded web dashboard
+port            = 5100          # listen port
+bind            = "127.0.0.1"  # "0.0.0.0" exposes on LAN (no auth)
+static_dir      = ""            # "" = embedded HTML; path = serve from disk
+refresh_seconds = 30            # auto-refresh interval in seconds (0 = off)
+default_since   = "24h"         # default time window: 1h / 6h / 24h / 7d / 30d
+top_limit       = 200           # max rows returned by /api/top

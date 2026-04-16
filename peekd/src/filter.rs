@@ -197,3 +197,50 @@ pub fn build_with_lua(config: &Config) -> Vec<Box<dyn EventFilter>> {
     chain.extend(load_lua_filters(&crate::config::config_dir()));
     chain
 }
+
+// ============================================================================
+// Extra ignores: runtime-managed ignore lists loaded from ignore_extra.toml
+// ============================================================================
+
+use std::path::Path;
+
+#[derive(Default, Clone)]
+pub struct ExtraIgnores {
+    pub exe:    Vec<String>,
+    pub domain: Vec<String>,
+    pub raddr:  Vec<String>,
+}
+
+pub fn load_extra_ignores(config_dir: &Path) -> ExtraIgnores {
+    let path = config_dir.join("ignore_extra.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else { return ExtraIgnores::default() };
+    let Ok(val) = toml::from_str::<toml::Value>(&text) else { return ExtraIgnores::default() };
+    fn get_list(val: &toml::Value, key: &str) -> Vec<String> {
+        val.get(key).and_then(|v| v.as_array()).map(|arr| {
+            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+        }).unwrap_or_default()
+    }
+    ExtraIgnores {
+        exe:    get_list(&val, "exe"),
+        domain: get_list(&val, "domain"),
+        raddr:  get_list(&val, "raddr"),
+    }
+}
+
+pub fn save_extra_ignore(config_dir: &Path, kind: &str, value: &str) -> anyhow::Result<()> {
+    let path = config_dir.join("ignore_extra.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut val: toml::Value = if text.is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&text)?
+    };
+    let table = val.as_table_mut().ok_or_else(|| anyhow::anyhow!("invalid toml"))?;
+    let arr = table.entry(kind).or_insert_with(|| toml::Value::Array(vec![]));
+    if let Some(list) = arr.as_array_mut() {
+        let v = toml::Value::String(value.to_string());
+        if !list.contains(&v) { list.push(v); }
+    }
+    std::fs::write(&path, toml::to_string_pretty(&val)?)?;
+    Ok(())
+}

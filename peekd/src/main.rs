@@ -121,8 +121,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Web { port }) => {
-            let config = config::load().map_err(|e| anyhow::anyhow!("{}", e))?;
-            return web::serve(port, &config.web.bind, &config.web.static_dir).await;
+            let mut cfg = config::load().map_err(|e| anyhow::anyhow!("{}", e))
+                .map(|c| c.web)
+                .unwrap_or_default();
+            cfg.port = port;
+            return web::serve(cfg).await;
         }
         Some(Commands::Report { since, top, json }) => {
             let config = config::load().map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -247,14 +250,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 3b. Web dashboard (optional)
     {
-        let port = web_port.unwrap_or_else(|| {
-            if config.web.enabled { config.web.port } else { 0 }
-        });
-        if port > 0 {
-            let bind       = config.web.bind.clone();
-            let static_dir = config.web.static_dir.clone();
+        let mut web_cfg = config.web.clone();
+        if let Some(p) = web_port { web_cfg.port = p; web_cfg.enabled = true; }
+        if web_cfg.enabled && web_cfg.port > 0 {
             tokio::spawn(async move {
-                if let Err(e) = web::serve(port, &bind, &static_dir).await {
+                if let Err(e) = web::serve(web_cfg).await {
                     error!("web serve error: {}", e);
                 }
             });
@@ -484,11 +484,16 @@ async fn main() -> anyhow::Result<()> {
     let filtered_rx_storage = filtered_tx.subscribe();
     let config_clone = config.clone();
     let metrics_storage = metrics.clone();
-    tokio::spawn(async move {
-        if let Err(e) = storage::run(filtered_rx_storage, config_clone, metrics_storage).await {
-            error!("storage error: {}", e);
+    let writer_tx_storage = tokio::spawn(async move {
+        match storage::run(filtered_rx_storage, config_clone, metrics_storage).await {
+            Ok(tx) => Some(tx),
+            Err(e) => {
+                error!("storage error: {}", e);
+                None
+            }
         }
     });
+    let writer_tx = writer_tx_storage.await.ok().flatten().unwrap();
 
     // 10. Alerts task (hot-reloadable via Arc<RwLock<>>)
     let filtered_rx_alerts = filtered_tx.subscribe();
@@ -496,8 +501,9 @@ async fn main() -> anyhow::Result<()> {
     let alerts_rules = alerts::load_shared_rules(&config_clone);
     let alerts_rules_reload = alerts_rules.clone();
     let metrics_alerts = metrics.clone();
+    let writer_tx_alerts = writer_tx.clone();
     tokio::spawn(async move {
-        alerts::run(filtered_rx_alerts, config_clone, alerts_rules, metrics_alerts).await;
+        alerts::run(filtered_rx_alerts, config_clone, alerts_rules, metrics_alerts, writer_tx_alerts).await;
     });
 
     // 12. State flush task (periodic flush every 30s)

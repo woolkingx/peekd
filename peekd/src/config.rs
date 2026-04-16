@@ -33,11 +33,16 @@ pub struct Config {
 pub struct WebConfig {
     pub enabled: bool,
     pub port: u16,
+    /// Bind address. Default 127.0.0.1. Set "0.0.0.0" to expose on LAN (no auth).
     pub bind: String,
-    pub top_limit: u32,
+    /// "" = serve embedded HTML (production). Path = serve from disk (dev/custom).
     pub static_dir: String,
+    /// Auto-refresh interval seconds. 0 = disabled.
     pub refresh_seconds: u64,
+    /// Default time window shown on load: 1h / 6h / 24h / 7d / 30d.
     pub default_since: String,
+    /// Maximum rows returned by /api/top.
+    pub top_limit: u32,
 }
 
 /// DatabaseConfig: SQLite storage settings.
@@ -179,11 +184,11 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             port: 5100,
-            bind: String::from("127.0.0.1"),
-            top_limit: 200,
+            bind: "127.0.0.1".into(),
             static_dir: String::new(),
             refresh_seconds: 30,
-            default_since: String::from("24h"),
+            default_since: "24h".into(),
+            top_limit: 200,
         }
     }
 }

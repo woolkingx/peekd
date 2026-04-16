@@ -39,8 +39,9 @@ struct ExeMetadata {
 // Writer thread message
 // ============================================================================
 
-enum WriterMsg {
+pub enum WriterMsg {
     Events(Vec<BpfEvent>),
+    AlertEvent { ts: i64, rule: String, exe: String, raddr: String, domain: String, action: String },
     Flush,
     Shutdown,
 }
@@ -140,6 +141,14 @@ impl DbWriter {
                 Ok(WriterMsg::Events(events)) => {
                     self.accumulate(events);
                 }
+                Ok(WriterMsg::AlertEvent { ts, rule, exe, raddr, domain, action }) => {
+                    if let Err(e) = self.db.execute(
+                        "INSERT INTO alert_events (ts, rule, exe, raddr, domain, action) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![ts, rule, exe, raddr, domain, action],
+                    ) {
+                        error!("alert event insert failed: {}", e);
+                    }
+                }
                 Ok(WriterMsg::Flush) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if last_flush.elapsed().as_secs() >= flush_secs || matches!(rx.try_recv(), Err(_)) {
                         if let Err(e) = self.flush() {
@@ -170,16 +179,19 @@ impl DbWriter {
 // Public run() function
 // ============================================================================
 
+pub type AlertEventSender = std::sync::mpsc::Sender<WriterMsg>;
+
 /// Run the storage task.
 ///
 /// Spawns a dedicated writer thread that owns the SQLite Connection.
 /// Receives BpfEvent from broadcast, relays batches to writer via std::sync::mpsc.
 /// Writer thread flushes on interval — no Mutex, no spawn_blocking per flush.
+/// Returns the writer channel sender for alert events.
 pub async fn run(
     mut rx: broadcast::Receiver<BpfEvent>,
     config: Arc<Config>,
     metrics: Arc<crate::metrics::Metrics>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<AlertEventSender, Box<dyn std::error::Error>> {
     let db_path = crate::config::db_path();
     info!("opening db: {}", db_path.display());
     // Ensure parent directory exists
@@ -237,6 +249,9 @@ pub async fn run(
         }
     }
 
+    // Clone writer_tx before we move it into the shutdown task
+    let writer_tx_ret = writer_tx.clone();
+
     // Final flush on shutdown: send remaining batch + Shutdown, then wait for writer thread
     if !batch.is_empty() {
         let _ = writer_tx.send(WriterMsg::Events(batch));
@@ -248,7 +263,7 @@ pub async fn run(
             error!("storage writer thread panicked: {:?}", e);
         }
     }).await.ok();
-    Ok(())
+    Ok(writer_tx_ret)
 }
 
 // ============================================================================
@@ -280,7 +295,17 @@ fn _init_schema(db: &Connection) -> Result<(), Box<dyn std::error::Error>> {
             domain  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_contime ON connections(contime);
-        CREATE INDEX IF NOT EXISTS idx_exe_id_contime ON connections(exe_id, contime);"
+        CREATE INDEX IF NOT EXISTS idx_exe_id_contime ON connections(exe_id, contime);
+        CREATE TABLE IF NOT EXISTS alert_events (
+            id      INTEGER PRIMARY KEY,
+            ts      INTEGER NOT NULL,
+            rule    TEXT NOT NULL,
+            exe     TEXT NOT NULL,
+            raddr   TEXT NOT NULL,
+            domain  TEXT NOT NULL DEFAULT '',
+            action  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_ts ON alert_events(ts);"
     )?;
     Ok(())
 }
