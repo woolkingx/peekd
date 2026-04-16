@@ -121,7 +121,8 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Web { port }) => {
-            return web::serve(port).await;
+            let config = config::load().map_err(|e| anyhow::anyhow!("{}", e))?;
+            return web::serve(port, &config.web.bind, &config.web.static_dir).await;
         }
         Some(Commands::Report { since, top, json }) => {
             let config = config::load().map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -250,8 +251,10 @@ async fn main() -> anyhow::Result<()> {
             if config.web.enabled { config.web.port } else { 0 }
         });
         if port > 0 {
+            let bind       = config.web.bind.clone();
+            let static_dir = config.web.static_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = web::serve(port).await {
+                if let Err(e) = web::serve(port, &bind, &static_dir).await {
                     error!("web serve error: {}", e);
                 }
             });

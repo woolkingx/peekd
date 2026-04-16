@@ -27,7 +27,7 @@ CARGO_BUILD_JOBS=1 cargo build --release -p peekd
 sudo install -m 755 target/release/peekd /usr/local/sbin/
 
 # Directories
-sudo mkdir -p /etc/peekd /var/lib/peekd /var/log/peekd
+sudo mkdir -p /etc/peekd /var/lib/peekd /var/log/peekd /run/peekd
 
 # Config files
 sudo install -m 640 config/config.toml /etc/peekd/
@@ -46,6 +46,52 @@ sudo systemctl status peekd
 journalctl -u peekd -f
 ```
 
+## Web Dashboard
+
+The web dashboard runs on `http://127.0.0.1:5100` by default.
+
+Enabled by default (`[web] enabled = true` in config.toml). Open in browser after daemon starts:
+
+```
+http://localhost:5100
+```
+
+### Configuration (`/etc/peekd/config.toml`)
+
+```toml
+[web]
+enabled = true
+port = 5100
+bind = "127.0.0.1"       # set to "0.0.0.0" to expose on LAN
+top_limit = 200           # max destinations shown in /api/top
+static_dir = ""           # "" = embedded HTML; path = serve from disk
+refresh_seconds = 30      # dashboard auto-refresh interval
+default_since = "24h"     # default time range on page load
+```
+
+### Custom frontend (optional)
+
+To serve HTML/JS from disk (allows editing without recompile):
+
+```bash
+sudo mkdir -p /etc/peekd/web
+# copy or symlink your custom index.html + assets
+sudo cp src/web.html /etc/peekd/web/index.html
+```
+
+Then set in config.toml:
+
+```toml
+[web]
+static_dir = "/etc/peekd/web"
+```
+
+Reload config:
+
+```bash
+sudo kill -HUP $(pidof peekd)
+```
+
 ## Configuration
 
 | File | Purpose |
@@ -53,7 +99,7 @@ journalctl -u peekd -f
 | `/etc/peekd/config.toml` | Main config (database, log filters, web) |
 | `/etc/peekd/alerts.toml` | Alert rules |
 
-Edit then reload alerts without restart:
+Hot-reload config and alert rules without restart:
 
 ```bash
 sudo kill -HUP $(pidof peekd)

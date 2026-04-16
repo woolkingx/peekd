@@ -16,5 +16,10 @@ enabled = true
 interval_seconds = 60
 
 [web]
-enabled = false
+enabled = true
 port = 5100
+bind = "0.0.0.0"         # set to "127.0.0.1" to restrict to localhost
+top_limit = 200           # max destinations shown in /api/top
+static_dir = ""           # "" = embedded HTML; path = serve from disk
+refresh_seconds = 30      # dashboard auto-refresh interval
+default_since = "24h"     # default time range on page load

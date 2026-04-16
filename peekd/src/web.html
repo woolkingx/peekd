@@ -8,41 +8,50 @@
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: monospace; background: #0d1117; color: #c9d1d9; font-size: 13px; }
-header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; }
-header h1 { font-size: 16px; color: #58a6ff; }
-select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px; }
-.stats { display: flex; gap: 12px; padding: 12px 20px; border-bottom: 1px solid #30363d; }
-.stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 16px; min-width: 120px; }
-.stat-label { color: #8b949e; font-size: 11px; margin-bottom: 4px; }
-.stat-value { font-size: 18px; color: #58a6ff; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: #161b22; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
+header h1 { font-size: 15px; color: #58a6ff; margin-right: 4px; }
+.btn { background: #21262d; color: #8b949e; border: 1px solid #30363d; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-family: monospace; font-size: 12px; }
+.btn:hover { border-color: #58a6ff; color: #c9d1d9; }
+.btn.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+.date-input { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 3px 6px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+.date-input:focus { outline: none; border-color: #58a6ff; }
+.sep { color: #30363d; }
+select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+.hstat { display: flex; flex-direction: column; align-items: flex-end; }
+.hstat-label { color: #6e7681; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
+.hstat-value { color: #c9d1d9; font-size: 13px; font-weight: bold; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px 20px; }
 .panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; }
-.panel h2 { font-size: 13px; color: #8b949e; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-canvas { max-height: 240px; }
+.panel h2 { font-size: 12px; color: #8b949e; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+canvas { max-height: 220px; }
 .full { grid-column: 1 / -1; }
 table { width: 100%; border-collapse: collapse; }
 th { text-align: left; color: #8b949e; font-weight: normal; padding: 4px 8px; border-bottom: 1px solid #21262d; font-size: 11px; text-transform: uppercase; }
+th.num { text-align: right; }
 td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
-td.num, th.num { text-align: right; }
-td.num { color: #8b949e; }
+td.num { text-align: right; color: #8b949e; }
+.filter-row th { padding: 2px 4px; }
+.col-filter { width: 100%; padding: 3px 6px; background: #0d1117; color: #c9d1d9; border: 1px solid #21262d; border-radius: 3px; font-family: monospace; font-size: 11px; }
+.col-filter:focus { outline: none; border-color: #58a6ff; }
+.col-filter::placeholder { color: #484f58; }
 .dest-raddr { color: #58a6ff; }
 .dest-domain { color: #8b949e; font-size: 11px; }
-details summary { cursor: pointer; color: #8b949e; font-size: 11px; margin-top: 2px; }
-details td { color: #6e7681; font-size: 11px; }
+details summary { cursor: pointer; color: #6e7681; font-size: 11px; margin-top: 2px; }
 </style>
 </head>
 <body>
 <header>
   <h1>peekd</h1>
-  <label>since
-    <select id="since" onchange="reload()">
-      <option value="1h">1h</option>
-      <option value="24h" selected>24h</option>
-      <option value="7d">7d</option>
-      <option value="30d">30d</option>
-    </select>
-  </label>
-  <label>group by
+  <span class="sep">|</span>
+  <button class="btn since-btn" data-since="1h"  onclick="setSince('1h')">1h</button>
+  <button class="btn since-btn" data-since="24h" onclick="setSince('24h')">24h</button>
+  <button class="btn since-btn" data-since="7d"  onclick="setSince('7d')">7d</button>
+  <button class="btn since-btn" data-since="30d" onclick="setSince('30d')">30d</button>
+  <input class="date-input" id="fromDate" type="date" onchange="onDateChange()">
+  <span style="color:#6e7681;font-size:11px">→</span>
+  <input class="date-input" id="toDate"   type="date" onchange="onDateChange()">
+  <span class="sep">|</span>
+  <label style="color:#6e7681;font-size:12px">group
     <select id="dim" onchange="reloadData()">
       <option value="exe" selected>exe</option>
       <option value="name">name</option>
@@ -52,19 +61,18 @@ details td { color: #6e7681; font-size: 11px; }
       <option value="uid">uid</option>
     </select>
   </label>
-  <span id="updated" style="color:#6e7681;margin-left:auto;font-size:11px;"></span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:16px;">
+    <div class="hstat"><span class="hstat-label">flows</span><span class="hstat-value" id="s-flows">—</span></div>
+    <div class="hstat"><span class="hstat-label">sent</span><span class="hstat-value" id="s-send">—</span></div>
+    <div class="hstat"><span class="hstat-label">recv</span><span class="hstat-value" id="s-recv">—</span></div>
+    <div class="hstat"><span class="hstat-label">IPs</span><span class="hstat-value" id="s-ips">—</span></div>
+    <span id="updated" style="color:#6e7681;font-size:11px;border-left:1px solid #30363d;padding-left:14px;"></span>
+  </div>
 </header>
-
-<div class="stats">
-  <div class="stat"><div class="stat-label">flows</div><div class="stat-value" id="s-flows">—</div></div>
-  <div class="stat"><div class="stat-label">sent</div><div class="stat-value" id="s-send">—</div></div>
-  <div class="stat"><div class="stat-label">recv</div><div class="stat-value" id="s-recv">—</div></div>
-  <div class="stat"><div class="stat-label">unique IPs</div><div class="stat-value" id="s-ips">—</div></div>
-</div>
 
 <div class="grid">
   <div class="panel">
-    <h2>Hourly flows</h2>
+    <h2>Flows over time</h2>
     <canvas id="hourChart"></canvas>
   </div>
   <div class="panel">
@@ -73,9 +81,24 @@ details td { color: #6e7681; font-size: 11px; }
   </div>
   <div class="panel full">
     <h2>All destinations</h2>
-    <div style="max-height:480px;overflow-y:auto">
+    <div style="max-height:520px;overflow-y:auto">
     <table id="topTable">
-      <thead style="position:sticky;top:0;background:#161b22"><tr><th>destination</th><th style="text-align:right;padding:4px 8px">flows</th><th style="text-align:right;padding:4px 8px">sent</th><th style="text-align:right;padding:4px 8px">recv</th><th style="text-align:right;padding:4px 8px">total</th></tr></thead>
+      <thead style="position:sticky;top:0;background:#161b22">
+        <tr>
+          <th>destination</th>
+          <th class="num">flows</th>
+          <th class="num">sent</th>
+          <th class="num">recv</th>
+          <th class="num">total</th>
+        </tr>
+        <tr class="filter-row">
+          <th><input class="col-filter" id="f-dest"  type="search" placeholder="ip / host / domain / exe" oninput="filterDests()"></th>
+          <th><input class="col-filter" id="f-flows" type="search" placeholder="≥" oninput="filterDests()"></th>
+          <th><input class="col-filter" id="f-send"  type="search" placeholder="≥ bytes" oninput="filterDests()"></th>
+          <th><input class="col-filter" id="f-recv"  type="search" placeholder="≥ bytes" oninput="filterDests()"></th>
+          <th><input class="col-filter" id="f-total" type="search" placeholder="≥ bytes" oninput="filterDests()"></th>
+        </tr>
+      </thead>
       <tbody></tbody>
     </table>
     </div>
@@ -83,62 +106,125 @@ details td { color: #6e7681; font-size: 11px; }
 </div>
 
 <script>
+// ── utilities ────────────────────────────────────────────────────────────────
 const fmt = b => {
   if (b >= 1e9) return (b/1e9).toFixed(1)+'G';
   if (b >= 1e6) return (b/1e6).toFixed(1)+'M';
   if (b >= 1e3) return (b/1e3).toFixed(1)+'K';
   return b+'B';
 };
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-let hourChart, barChart;
+// local-date string YYYY-MM-DD
+const dateStr = d => d.toLocaleDateString('sv');
 
-const chartOpts = (label, color) => ({
-  responsive: true,
-  maintainAspectRatio: true,
-  plugins: { legend: { display: false } },
-  scales: {
-    x: { ticks: { color: '#8b949e', font: { family: 'monospace', size: 11 } }, grid: { color: '#21262d' } },
-    y: { ticks: { color: '#8b949e', font: { family: 'monospace', size: 11 }, callback: v => fmt(v) }, grid: { color: '#21262d' } }
+// unix ts (seconds) → local date string
+const tsToDate = ts => dateStr(new Date(ts * 1000));
+
+// date string → unix ts (local midnight = start of day)
+const dateToTs  = s => Math.floor(new Date(s + 'T00:00:00').getTime() / 1000);
+const dateTsEnd = s => Math.floor(new Date(s + 'T23:59:59').getTime() / 1000);
+
+// ── hash permalink ────────────────────────────────────────────────────────────
+function parseHash() {
+  const p = Object.fromEntries(
+    window.location.hash.slice(1).split('&').filter(Boolean).map(s => s.split('='))
+  );
+  return { from: p.from ? parseInt(p.from) : null, to: p.to ? parseInt(p.to) : null };
+}
+function updateHash(from, to) {
+  history.replaceState(null, '', `#from=${from}&to=${to}`);
+}
+
+// ── time range ────────────────────────────────────────────────────────────────
+// Set date pickers + highlight button, without triggering reload
+function applyShortcut(since) {
+  const now  = new Date();
+  const from = new Date(now);
+  switch (since) {
+    case '1h':  from.setHours(now.getHours() - 1); break;
+    case '7d':  from.setDate(now.getDate() - 7);   break;
+    case '30d': from.setDate(now.getDate() - 30);  break;
+    default:    from.setDate(now.getDate() - 1);   break; // 24h
   }
-});
+  document.getElementById('fromDate').value = dateStr(from);
+  document.getElementById('toDate').value   = dateStr(now);
+  document.querySelectorAll('.since-btn').forEach(
+    b => b.classList.toggle('active', b.dataset.since === since)
+  );
+}
+
+// Button click handler: apply shortcut then reload
+function setSince(since) {
+  applyShortcut(since);
+  reload();
+}
+
+function onDateChange() {
+  document.querySelectorAll('.since-btn').forEach(b => b.classList.remove('active'));
+  reload();
+}
+
+function getFromTo() {
+  const fv = document.getElementById('fromDate').value;
+  const tv = document.getElementById('toDate').value;
+  const now = Math.floor(Date.now() / 1000);
+  const from = fv ? dateToTs(fv)  : now - 86400;
+  const to   = tv ? dateTsEnd(tv) : now;
+  return { from, to };
+}
+
+function snap_for_span(span) {
+  if (span <=   7_200) return '1h';
+  if (span <= 172_800) return '24h';
+  if (span <= 691_200) return '7d';
+  return '30d';
+}
+
+// ── charts ────────────────────────────────────────────────────────────────────
+let hourChart, barChart, _cachedDests = [];
+
+const scaleOpts = {
+  x: { ticks: { color: '#8b949e', font: { family: 'monospace', size: 10 } }, grid: { color: '#21262d' } },
+  y: { ticks: { color: '#8b949e', font: { family: 'monospace', size: 10 }, callback: v => fmt(v) }, grid: { color: '#21262d' } }
+};
 
 function initCharts() {
   hourChart = new Chart(document.getElementById('hourChart'), {
     type: 'bar',
     data: { labels: [], datasets: [{ label: 'flows', data: [], backgroundColor: '#1f6feb' }] },
-    options: chartOpts('flows', '#1f6feb')
+    options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { display: false } }, scales: scaleOpts }
   });
   barChart = new Chart(document.getElementById('barChart'), {
     type: 'bar',
     data: { labels: [], datasets: [{ label: 'bytes', data: [], backgroundColor: '#388bfd' }] },
-    options: chartOpts('bytes', '#388bfd')
+    options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { display: false } }, scales: scaleOpts }
   });
 }
 
-async function loadSummary(since) {
-  const r = await fetch(`/api/summary?since=${since}`);
+// ── API loaders ───────────────────────────────────────────────────────────────
+async function loadSummary(from, to) {
+  const r = await fetch(`/api/summary?from=${from}&to=${to}`);
   const d = await r.json();
   document.getElementById('s-flows').textContent = d.flows.toLocaleString();
-  document.getElementById('s-send').textContent = fmt(d.send);
-  document.getElementById('s-recv').textContent = fmt(d.recv);
-  document.getElementById('s-ips').textContent = d.unique_ips.toLocaleString();
-
-  const labels = d.hours.map(h => h.hour + ':00');
-  const flows  = d.hours.map(h => h.flows);
-  hourChart.data.labels = labels;
-  hourChart.data.datasets[0].data = flows;
+  document.getElementById('s-send').textContent  = fmt(d.send);
+  document.getElementById('s-recv').textContent  = fmt(d.recv);
+  document.getElementById('s-ips').textContent   = d.unique_ips.toLocaleString();
+  hourChart.data.labels             = d.hours.map(h => h.hour);
+  hourChart.data.datasets[0].data   = d.hours.map(h => h.flows);
   hourChart.update();
 }
 
-async function loadData(since, dim) {
+async function loadData(from, to) {
+  const dim = document.getElementById('dim').value;
   document.getElementById('dim-label').textContent = dim;
-  const r = await fetch(`/api/data?since=${since}&dim=${dim}`);
+  const r = await fetch(`/api/data?from=${from}&to=${to}&dim=${dim}`);
   const d = await r.json();
   const top = d.rows.slice(0, 15);
   const fullLabels = top.map(r => r.label);
-  barChart.data.labels = top.map((_, i) => i + 1);
-  barChart.data.datasets[0].data = top.map(r => r.send + r.recv);
-  barChart.options.plugins.tooltip = {
+  barChart.data.labels              = top.map((_, i) => i + 1);
+  barChart.data.datasets[0].data    = top.map(r => r.send + r.recv);
+  barChart.options.plugins.tooltip  = {
     callbacks: {
       title: items => fullLabels[items[0].dataIndex],
       label: items => fmt(items.raw)
@@ -147,54 +233,119 @@ async function loadData(since, dim) {
   barChart.update();
 }
 
-async function loadTop(since) {
-  const r = await fetch(`/api/top?since=${since}`);
+async function loadTop(from, to) {
+  const r = await fetch(`/api/top?from=${from}&to=${to}`);
   const d = await r.json();
-  const tbody = document.querySelector('#topTable tbody');
-  tbody.innerHTML = '';
-  for (const dest of d.dests) {
+  _cachedDests = d.dests;
+  filterDests();
+}
+
+// ── destination table ─────────────────────────────────────────────────────────
+function parseBytes(s) {
+  s = s.trim();
+  if (!s) return 0;
+  const n = parseFloat(s);
+  if (s.endsWith('G')) return n * 1e9;
+  if (s.endsWith('M')) return n * 1e6;
+  if (s.endsWith('K')) return n * 1e3;
+  return n;
+}
+
+function filterDests() {
+  const q     = (document.getElementById('f-dest').value  || '').trim().toLowerCase();
+  const flows = parseInt(document.getElementById('f-flows').value || '0') || 0;
+  const send  = parseBytes(document.getElementById('f-send').value);
+  const recv  = parseBytes(document.getElementById('f-recv').value);
+  const total = parseBytes(document.getElementById('f-total').value);
+
+  const filtered = _cachedDests.filter(d => {
+    if (flows && d.flows < flows) return false;
+    if (send  && d.send  < send)  return false;
+    if (recv  && d.recv  < recv)  return false;
+    if (total && (d.send + d.recv) < total) return false;
+    if (q) {
+      const hay = [d.raddr, d.hostname, d.domain, ...d.subs.map(s => s.name)].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  renderDests(filtered);
+}
+
+function renderDests(dests) {
+  const rows = dests.map(dest => {
     const h = dest.hostname || dest.domain;
-    const label = h ? `<span class="dest-raddr">${dest.raddr}</span> <span class="dest-domain">(${h})</span>`
-                    : `<span class="dest-raddr">${dest.raddr}</span>`;
+    const label = h
+      ? `<span class="dest-raddr">${esc(dest.raddr)}</span> <span class="dest-domain">(${esc(h)})</span>`
+      : `<span class="dest-raddr">${esc(dest.raddr)}</span>`;
     const subRows = dest.subs.map(s =>
       `<tr>
-        <td style="padding-left:16px;color:#6e7681;white-space:nowrap">:${s.rport}&nbsp;&nbsp;${s.name || '?'} uid=${s.uid}</td>
+        <td style="padding-left:16px;color:#6e7681;white-space:nowrap">:${esc(s.rport)}&nbsp;&nbsp;${esc(s.name||'?')} uid=${esc(s.uid)}</td>
         <td class="num" style="color:#6e7681">${s.flows}</td>
         <td class="num" style="color:#6e7681">${fmt(s.send)}</td>
         <td class="num" style="color:#6e7681">${fmt(s.recv)}</td>
         <td class="num" style="color:#6e7681">${fmt(s.send+s.recv)}</td>
       </tr>`
     ).join('');
-    tbody.innerHTML += `
-      <tr>
-        <td>
-          ${label}
-          ${dest.subs.length ? `<details><summary style="color:#6e7681;font-size:11px;cursor:pointer">${dest.subs.length} processes</summary><table>${subRows}</table></details>` : ''}
-        </td>
-        <td class="num">${dest.flows}</td>
-        <td class="num">${fmt(dest.send)}</td>
-        <td class="num">${fmt(dest.recv)}</td>
-        <td class="num">${fmt(dest.send+dest.recv)}</td>
-      </tr>`;
-  }
+    return `<tr>
+      <td>
+        ${label}
+        ${dest.subs.length ? `<details><summary>${dest.subs.length} processes</summary><table>${subRows}</table></details>` : ''}
+      </td>
+      <td class="num">${dest.flows}</td>
+      <td class="num">${fmt(dest.send)}</td>
+      <td class="num">${fmt(dest.recv)}</td>
+      <td class="num">${fmt(dest.send+dest.recv)}</td>
+    </tr>`;
+  });
+  document.querySelector('#topTable tbody').innerHTML = rows.join('');
 }
 
+// ── reload orchestration ──────────────────────────────────────────────────────
 async function reloadData() {
-  const since = document.getElementById('since').value;
-  const dim   = document.getElementById('dim').value;
-  await loadData(since, dim);
+  const { from, to } = getFromTo();
+  await loadData(from, to);
 }
 
 async function reload() {
-  const since = document.getElementById('since').value;
-  const dim   = document.getElementById('dim').value;
-  await Promise.all([loadSummary(since), loadData(since, dim), loadTop(since)]);
+  const { from, to } = getFromTo();
+  updateHash(from, to);
+  await Promise.all([loadSummary(from, to), loadData(from, to), loadTop(from, to)]);
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
-initCharts();
-reload();
-setInterval(reload, 30000);
+// ── bootstrap ─────────────────────────────────────────────────────────────────
+async function init() {
+  initCharts();
+
+  // load config: refresh_seconds + default_since
+  let refreshSeconds = 30;
+  let defaultSince   = '24h';
+  try {
+    const r = await fetch('/api/config');
+    const c = await r.json();
+    if (c.refresh_seconds) refreshSeconds = c.refresh_seconds;
+    if (c.default_since)   defaultSince   = c.default_since;
+  } catch (_) {}
+
+  // restore from hash or apply default_since
+  const hash = parseHash();
+  if (hash.from && hash.to) {
+    document.getElementById('fromDate').value = tsToDate(hash.from);
+    document.getElementById('toDate').value   = tsToDate(hash.to);
+    // highlight matching since button if span matches a shortcut
+    const span = hash.to - hash.from;
+    const snap = snap_for_span(span);
+    if (snap) document.querySelector(`[data-since="${snap}"]`)?.classList.add('active');
+  } else {
+    applyShortcut(defaultSince); // set pickers only, no reload yet
+  }
+
+  await reload();
+  setInterval(reload, refreshSeconds * 1000);
+}
+
+init();
 </script>
 </body>
 </html>

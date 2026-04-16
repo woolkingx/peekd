@@ -33,6 +33,11 @@ pub struct Config {
 pub struct WebConfig {
     pub enabled: bool,
     pub port: u16,
+    pub bind: String,
+    pub top_limit: u32,
+    pub static_dir: String,
+    pub refresh_seconds: u64,
+    pub default_since: String,
 }
 
 /// DatabaseConfig: SQLite storage settings.
@@ -174,6 +179,11 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             port: 5100,
+            bind: String::from("127.0.0.1"),
+            top_limit: 200,
+            static_dir: String::new(),
+            refresh_seconds: 30,
+            default_since: String::from("24h"),
         }
     }
 }
