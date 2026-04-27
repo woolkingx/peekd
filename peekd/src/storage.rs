@@ -52,6 +52,7 @@ pub enum WriterMsg {
 
 struct DbWriter {
     db: Connection,
+    db_path: std::path::PathBuf,
     traffic: HashMap<TrafficKey, (u32, u32)>,
     exe_metadata: HashMap<String, ExeMetadata>,
     exe_id_cache: HashMap<ExeKey, i64>,
@@ -60,9 +61,10 @@ struct DbWriter {
 }
 
 impl DbWriter {
-    fn new(db: Connection, retention_days: u32) -> Self {
+    fn new(db: Connection, db_path: std::path::PathBuf, retention_days: u32) -> Self {
         Self {
             db,
+            db_path,
             traffic: HashMap::new(),
             exe_metadata: HashMap::new(),
             exe_id_cache: HashMap::new(),
@@ -110,6 +112,28 @@ impl DbWriter {
     }
 
     fn flush(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Detect WAL file deleted externally (e.g. sqlite3 CLI checkpoint-and-delete).
+        // Reopen connection so new WAL/SHM are created on disk and readers stay in sync.
+        let wal_path = {
+            let mut p = self.db_path.as_os_str().to_owned();
+            p.push("-wal");
+            std::path::PathBuf::from(p)
+        };
+        if !wal_path.exists() {
+            warn!("WAL file missing, reopening database connection");
+            match Connection::open(&self.db_path) {
+                Ok(new_conn) => {
+                    if let Err(e) = new_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;") {
+                        warn!("WAL pragma failed on reopen: {}", e);
+                    }
+                    self.db = new_conn;
+                }
+                Err(e) => {
+                    error!("failed to reopen database: {}", e);
+                }
+            }
+        }
+
         if self.traffic.is_empty() {
             return Ok(());
         }
@@ -211,7 +235,7 @@ pub async fn run(
 
     // Writer thread: owns Connection, receives via std::sync::mpsc (not tokio)
     let (writer_tx, writer_rx) = std::sync::mpsc::channel::<WriterMsg>();
-    let writer = DbWriter::new(db, config.database.retention_days);
+    let writer = DbWriter::new(db, db_path.clone(), config.database.retention_days);
     let writer_handle = thread::Builder::new()
         .name("peekd-db-writer".into())
         .spawn(move || writer.run(writer_rx))?;
