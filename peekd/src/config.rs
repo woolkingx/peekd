@@ -7,8 +7,8 @@
 //!
 //! File paths:
 //! - /etc/peekd/config.toml or $XDG_CONFIG_HOME/peekd/config.toml
-//! - /var/lib/peekd/peekd.db (SQLite database)
-//! - /var/log/peekd/ (exe.log, error.log, state.json)
+//! - /var/lib/peekd/ (SQLite database, state.json)
+//! - /var/log/peekd/ (peekd.log, exe.log, error.log)
 //! - /run/peekd/ (Unix sockets, metrics.json)
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// Top-level config struct with all subsystem configs.
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct Config {
     pub database: DatabaseConfig,
     pub log: LogConfig,
@@ -101,20 +101,6 @@ pub struct BroadcastConfig {
 #[serde(default)]
 pub struct MetricsConfig {
     pub interval_seconds: u64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            database: DatabaseConfig::default(),
-            log: LogConfig::default(),
-            desktop: DesktopConfig::default(),
-            monitoring: MonitoringConfig::default(),
-            broadcast: BroadcastConfig::default(),
-            metrics: MetricsConfig::default(),
-            web: WebConfig::default(),
-        }
-    }
 }
 
 impl Default for DatabaseConfig {
@@ -213,6 +199,11 @@ fn _validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.database.write_limit_seconds == 0 {
         return Err("database.write_limit_seconds must be >= 1 (0 causes CPU spin)".into());
     }
+    if config.monitoring.perf_ring_buffer_pages == 0
+        || !config.monitoring.perf_ring_buffer_pages.is_power_of_two()
+    {
+        return Err("monitoring.perf_ring_buffer_pages must be a power of two >= 1".into());
+    }
     Ok(())
 }
 
@@ -263,4 +254,18 @@ pub fn run_dir() -> PathBuf {
 /// Get database path: data_dir/peekd.db
 pub fn db_path() -> PathBuf {
     data_dir().join("peekd.db")
+}
+
+#[cfg(test)]
+mod tests_config {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_invalid_perf_ring_pages() {
+        let mut config = Config::default();
+        config.monitoring.perf_ring_buffer_pages = 3;
+
+        let err = _validate(&config).unwrap_err();
+        assert!(err.to_string().contains("perf_ring_buffer_pages"));
+    }
 }

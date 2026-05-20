@@ -6,11 +6,11 @@
 //! Listens to fanotify FAN_MODIFY events to track file modifications.
 //! fd_path is cached for stable hashing in later stages.
 
-use std::sync::Arc;
-use std::os::unix::io::RawFd;
-use lru::LruCache;
-use tokio::sync::Mutex;
 use crate::metrics::Metrics;
+use lru::LruCache;
+use std::os::unix::io::RawFd;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const FAN_MODIFY: u32 = 0x0002;
 const FAN_MARK_ADD: u32 = 0x0000001;
@@ -69,7 +69,9 @@ impl FdCache {
             self._mark_fanotify(evicted.fd, false);
             // G-7: explicitly close evicted fd to prevent fd leak
             if let Some(fd) = evicted.fd {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
     }
@@ -91,9 +93,7 @@ impl FdCache {
 
         let mut buf = [0u8; 4096];
         loop {
-            let n = unsafe {
-                libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::read(fan_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
             if n <= 0 {
                 break;
@@ -111,7 +111,7 @@ impl FdCache {
             return;
         };
 
-        let flags = if add { FAN_MARK_ADD as u32 } else { FAN_MARK_REMOVE as u32 };
+        let flags = if add { FAN_MARK_ADD } else { FAN_MARK_REMOVE };
         unsafe {
             let _ = libc::fanotify_mark(fan_fd, flags, FAN_MODIFY as u64, fd, std::ptr::null());
         }
@@ -129,7 +129,9 @@ impl FdCache {
                 }
             }
 
-            unsafe { let _ = libc::close(event.fd); }
+            unsafe {
+                let _ = libc::close(event.fd);
+            }
 
             offset += event.event_len as usize;
             if event.event_len == 0 {
@@ -143,10 +145,7 @@ impl FdCache {
 ///
 /// Uses AsyncFd for event-driven wakeup instead of polling.
 /// Falls back to 100ms polling if AsyncFd is unavailable.
-pub async fn fanotify_watcher(
-    cache: Arc<Mutex<FdCache>>,
-    _metrics: Arc<Metrics>,
-) {
+pub async fn fanotify_watcher(cache: Arc<Mutex<FdCache>>, _metrics: Arc<Metrics>) {
     use std::os::unix::io::RawFd;
     use tokio::io::unix::AsyncFd;
     use tokio::io::Interest;

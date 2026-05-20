@@ -9,8 +9,8 @@
 //!
 //! Communication: parent sends HashRequest via mpsc, child replies via oneshot.
 
+use sha2::{Digest, Sha256};
 use std::io::Read;
-use sha2::{Sha256, Digest};
 use tokio::sync::{mpsc, oneshot};
 
 /// Request to compute SHA256 of a file.
@@ -62,7 +62,9 @@ fn _hash_file(path: &str) -> Option<String> {
     let mut buf = [0u8; 8192];
     loop {
         let n = file.read(&mut buf).ok()?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     let result = hasher.finalize();
@@ -73,11 +75,7 @@ fn _hash_file(path: &str) -> Option<String> {
 ///
 /// Drops privileges immediately, then processes hash requests from mpsc channel.
 /// Each request gets a SHA256 hex string or None on failure.
-pub async fn worker(
-    mut rx: mpsc::Receiver<FuseRequest>,
-    user: String,
-    timeout_ms: u64,
-) {
+pub async fn worker(mut rx: mpsc::Receiver<FuseRequest>, user: String, timeout_ms: u64) {
     // Drop root first — worker can only compute hashes after this
     if !user.is_empty() && !_drop_root(&user) {
         tracing::error!("cannot operate without privilege drop, exiting worker");
@@ -89,9 +87,10 @@ pub async fn worker(
         let timeout = tokio::time::Duration::from_millis(timeout_ms);
 
         // Hash in spawn_blocking with timeout
-        let result = tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || {
-            _hash_file(&path)
-        }))
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || _hash_file(&path)),
+        )
         .await;
 
         let hash = match result {

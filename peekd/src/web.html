@@ -154,6 +154,36 @@ const chartOpts = (label, color) => ({
   }
 });
 
+function apiErrorMessage(payload, response) {
+  const err = payload && payload.error;
+  if (err && typeof err === 'object' && err.message) {
+    return `${err.code || response.status}: ${err.message}`;
+  }
+  if (typeof err === 'string') return err;
+  return `${response.status} ${response.statusText || 'HTTP error'}`;
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    if (response.ok) throw new Error('invalid JSON response');
+  }
+  if (!response.ok || (payload && payload.ok === false && payload.error)) {
+    throw new Error(apiErrorMessage(payload, response));
+  }
+  return payload || {};
+}
+
+function expectArray(payload, key, endpoint) {
+  if (!Array.isArray(payload[key])) {
+    throw new Error(`${endpoint} returned invalid payload: missing ${key}`);
+  }
+  return payload[key];
+}
+
 function initCharts() {
   hourChart = new Chart(document.getElementById('hourChart'), {
     type: 'bar',
@@ -175,15 +205,15 @@ async function loadSummary(since, from, to) {
     url += `?since=${since}`;
   }
   try {
-    const r = await fetch(url);
-    const d = await r.json();
-    document.getElementById('s-flows').textContent = d.flows.toLocaleString();
-    document.getElementById('s-send').textContent = fmt(d.send);
-    document.getElementById('s-recv').textContent = fmt(d.recv);
-    document.getElementById('s-ips').textContent = d.unique_ips.toLocaleString();
+    const d = await fetchJson(url);
+    const hours = expectArray(d, 'hours', '/api/summary');
+    document.getElementById('s-flows').textContent = Number(d.flows || 0).toLocaleString();
+    document.getElementById('s-send').textContent = fmt(Number(d.send || 0));
+    document.getElementById('s-recv').textContent = fmt(Number(d.recv || 0));
+    document.getElementById('s-ips').textContent = Number(d.unique_ips || 0).toLocaleString();
 
-    const labels = d.hours.map(h => h.hour);
-    const flows  = d.hours.map(h => h.flows);
+    const labels = hours.map(h => h.hour);
+    const flows  = hours.map(h => h.flows);
     hourChart.data.labels = labels;
     hourChart.data.datasets[0].data = flows;
     hourChart.update();
@@ -199,9 +229,9 @@ async function loadData(since, dim, from, to) {
     url += `&since=${since}`;
   }
   try {
-    const r = await fetch(url);
-    const d = await r.json();
-    const top = d.rows.slice(0, 15);
+    const d = await fetchJson(url);
+    const rows = expectArray(d, 'rows', '/api/data');
+    const top = rows.slice(0, 15);
     const fullLabels = top.map(r => r.label);
     barChart.data.labels = top.map((_, i) => i + 1);
     barChart.data.datasets[0].data = top.map(r => r.send + r.recv);
@@ -223,11 +253,11 @@ async function loadTop(since, dim, from, to) {
     url += `&since=${since}`;
   }
   try {
-    const r = await fetch(url);
-    const d = await r.json();
+    const d = await fetchJson(url);
+    const dests = expectArray(d, 'dests', '/api/top');
     const byRaddr = dim === 'raddr';
 
-    allDests = d.dests.map(dest => ({
+    allDests = dests.map(dest => ({
       ...dest,
       label: dest.label,
       hostname: dest.hostname || '',
@@ -284,7 +314,8 @@ function applyFilter() {
       const btnStyle = 'margin-left:6px;background:none;border:1px solid #30363d;color:#6e7681;cursor:pointer;font-size:10px;padding:1px 4px;border-radius:2px';
       labelHtml = labelSpan + `<button onclick="openDetail('${detailFilter}')" style="${btnStyle}">detail</button><button onclick="ignoreEntry('${escapeHtml(dest.label)}')" style="${btnStyle}">ignore</button>`;
     }
-    const subRows = dest.subs.map(s => {
+    const subs = Array.isArray(dest.subs) ? dest.subs : [];
+    const subRows = subs.map(s => {
       const subLabel = byRaddr
         ? `:${s.rport}&nbsp;&nbsp;${escapeHtml(s.name || '?')} uid=${s.uid}`
         : (s.domain ? `${escapeHtml(s.name)} <span style="color:#6e7681">(${escapeHtml(s.domain)})</span>` : escapeHtml(s.name));
@@ -296,12 +327,12 @@ function applyFilter() {
         <td class="num" style="color:#6e7681">${fmt(s.send+s.recv)}</td>
       </tr>`;
     }).join('');
-    const subSummary = byRaddr ? `${dest.subs.length} processes` : `${dest.subs.length} destinations`;
+    const subSummary = byRaddr ? `${subs.length} processes` : `${subs.length} destinations`;
     tbody.innerHTML += `
       <tr>
         <td>
           ${labelHtml}
-          ${dest.subs.length ? `<details><summary style="color:#6e7681;font-size:11px;cursor:pointer">${subSummary}</summary><table>${subRows}</table></details>` : ''}
+          ${subs.length ? `<details><summary style="color:#6e7681;font-size:11px;cursor:pointer">${subSummary}</summary><table>${subRows}</table></details>` : ''}
         </td>
         <td class="num">${dest.flows}</td>
         <td class="num">${fmt(dest.send)}</td>
@@ -451,8 +482,7 @@ async function startup() {
   initCharts();
 
   try {
-    const r = await fetch('/api/config');
-    const cfg = await r.json();
+    const cfg = await fetchJson('/api/config');
 
     // Set default_since if provided
     if (cfg.default_since) {
@@ -494,15 +524,15 @@ async function loadAlerts(since, from, to) {
   if (from !== undefined && to !== undefined) url += `?from=${from}&to=${to}`;
   else url += `?since=${since}`;
   try {
-    const r = await fetch(url);
-    const d = await r.json();
+    const d = await fetchJson(url);
+    const events = expectArray(d, 'events', '/api/alerts');
     const tbody = document.querySelector('#alertTable tbody');
     tbody.innerHTML = '';
-    if (!d.events || d.events.length === 0) {
+    if (events.length === 0) {
       tbody.innerHTML = '<tr><td colspan="5" style="color:#6e7681;padding:8px">no alerts</td></tr>';
       return;
     }
-    for (const e of d.events) {
+    for (const e of events) {
       const t = new Date(e.ts * 1000).toLocaleString();
       const dest = e.domain ? `${escapeHtml(e.raddr)} (${escapeHtml(e.domain)})` : escapeHtml(e.raddr);
       tbody.innerHTML += `<tr>
@@ -530,16 +560,16 @@ async function openDetail(filter) {
   tbody.innerHTML = '<tr><td colspan="5" style="color:#6e7681;padding:8px">loading...</td></tr>';
 
   try {
-    const r = await fetch(url);
-    const d = await r.json();
+    const d = await fetchJson(url);
+    const connections = expectArray(d, 'connections', '/api/connections');
     tbody.innerHTML = '';
-    if (!d.connections || d.connections.length === 0) {
+    if (connections.length === 0) {
       tbody.innerHTML = '<tr><td colspan="5" style="color:#6e7681;padding:8px">no connections</td></tr>';
       loadDetailTimeseries(filter);
       loadDetailProcTree(filter);
       return;
     }
-    for (const c of d.connections) {
+    for (const c of connections) {
       const t = new Date(c.ts * 1000).toLocaleTimeString();
       const dest = c.domain ? `${escapeHtml(c.raddr)} (${escapeHtml(c.domain)})` : escapeHtml(c.raddr);
       tbody.innerHTML += `<tr style="border-bottom:1px solid #21262d">
@@ -570,10 +600,11 @@ async function loadDetailTimeseries(filter) {
   if (from !== undefined && to !== undefined) url += `&from=${from}&to=${to}`;
   else url += `&since=${since}`;
   try {
-    const r = await fetch(url);
-    const d = await r.json();
+    const d = await fetchJson(url);
+    const series = expectArray(d, 'series', '/api/timeseries');
+    const buckets = expectArray(d, 'buckets', '/api/timeseries');
     const colors = ['#1f6feb','#388bfd','#58a6ff','#79c0ff','#3fb950','#56d364','#f85149','#ffa657'];
-    const datasets = (d.series || []).map((s, i) => ({
+    const datasets = series.map((s, i) => ({
       label: s.label,
       data: s.data,
       backgroundColor: colors[i % colors.length],
@@ -586,7 +617,7 @@ async function loadDetailTimeseries(filter) {
     }
     detailTsChart = new Chart(el, {
       type: 'bar',
-      data: { labels: d.buckets || [], datasets },
+      data: { labels: buckets, datasets },
       options: {
         responsive: true, maintainAspectRatio: true,
         plugins: { legend: { display: true, labels: { color: '#8b949e', font: { family: 'monospace', size: 10 } } } },
@@ -607,9 +638,8 @@ async function loadDetailProcTree(filter) {
   if (from !== undefined && to !== undefined) url += `&from=${from}&to=${to}`;
   else url += `&since=${since}`;
   try {
-    const r = await fetch(url);
-    const d = await r.json();
-    const conns = d.connections || [];
+    const d = await fetchJson(url);
+    const conns = expectArray(d, 'connections', '/api/connections');
 
     const exeStats = {};
     for (const c of conns) {

@@ -6,7 +6,7 @@ Rewritten from [picosnitch](https://github.com/elesiuta/picosnitch) in Rust for 
 
 ## What it does
 
-- Captures all AF_INET/AF_INET6 send/recv via `fexit/sock_sendmsg` and `fexit/sock_recvmsg` — covers TCP, UDP, ICMP, raw IP in a single hook point
+- Captures AF_INET/AF_INET6 send/recv via libbpf CO-RE kprobes on `inet_sendmsg` and `inet_recvmsg`
 - Tracks TCP connection lifecycle (connect, accept, close) via kprobe
 - Resolves DNS domains via uprobe on `getaddrinfo`
 - Resolves exe paths, cmdlines, sha256 hashes per process
@@ -19,7 +19,7 @@ Rewritten from [picosnitch](https://github.com/elesiuta/picosnitch) in Rust for 
 ## Architecture
 
 ```
-kernel BPF (fexit/kprobe/kretprobe/uprobe)
+kernel BPF (kprobe/kretprobe/uprobe)
     │
     ▼
 bpf.rs (perf buffer poll)
@@ -45,16 +45,17 @@ bpf.rs (perf buffer poll)
 ## Requirements
 
 - Linux kernel >= 5.8, BTF enabled (`CONFIG_DEBUG_INFO_BTF=y`)
+- Build tools: Rust stable, clang, libelf headers, pkg-config
 - Root or `CAP_BPF` + `CAP_NET_ADMIN`
 
 ## Build
 
 ```bash
-# Build eBPF bytecode (requires nightly + bpf target)
-cargo xtask build-ebpf --release
-
-# Build userspace daemon
+# Build daemon and generate the libbpf BPF object
 cargo build --release -p peekd
+
+# Full release gate: object sanity, userspace build, startup smoke
+scripts/verify_release.sh
 ```
 
 ## Install
@@ -199,8 +200,10 @@ Alert rules with `on_new_hash = true` trigger only on `NEW_HASH`, not `NEW_EXE`.
 
 | Hook | Kernel function | Captures |
 |------|----------------|----------|
-| `fexit/sock_sendmsg` | `sock_sendmsg` | All IP send bytes (TCP/UDP/ICMP/raw) |
-| `fexit/sock_recvmsg` | `sock_recvmsg` | All IP recv bytes (TCP/UDP/ICMP/raw) |
+| `kprobe/inet_sendmsg` | `inet_sendmsg` | IP send bytes |
+| `kretprobe/inet_sendmsg` | `inet_sendmsg` | IP send completion |
+| `kprobe/inet_recvmsg` | `inet_recvmsg` | IP recv entry |
+| `kretprobe/inet_recvmsg` | `inet_recvmsg` | IP recv bytes |
 | `kprobe/tcp_v4_connect` | `tcp_v4_connect` | TCP connect entry (stash sock ptr) |
 | `kretprobe/tcp_v4_connect` | `tcp_v4_connect` | TCP connect completion |
 | `kretprobe/inet_csk_accept` | `inet_csk_accept` | TCP accept |

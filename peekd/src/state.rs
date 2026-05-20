@@ -12,15 +12,16 @@
 
 use crate::config::Config;
 use crate::types::BpfEvent;
+use anyhow::Result;
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
-use chrono::Local;
-use anyhow::Result;
 
 /// SeenSet: fast read-only check for known (exe, sha256) pairs.
 ///
@@ -72,7 +73,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn load(_config: &Config) -> Self {
-        let path = crate::config::data_dir().join("state.json");
+        let path = _state_path();
         match fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str::<StateJson>(&content) {
                 Ok(s) => Self {
@@ -123,7 +124,12 @@ impl AppState {
     /// Also inserts into `seen`/`exe_seen` so hot-path enrichment checks stay current.
     ///
     /// Returns true if this event represents a new exe or new sha256.
-    pub fn handle_event(&mut self, event: &BpfEvent, seen: &SeenSet, exe_seen: &ExeSeenSet) -> bool {
+    pub fn handle_event(
+        &mut self,
+        event: &BpfEvent,
+        seen: &SeenSet,
+        exe_seen: &ExeSeenSet,
+    ) -> bool {
         let mut is_new = false;
 
         // Child exe/name tracking
@@ -190,8 +196,8 @@ impl AppState {
         };
 
         let json_str = serde_json::to_string_pretty(&state_json)?;
-        let path = data_dir.join("state.json");
-        let temp = data_dir.join("state.json.tmp");
+        let path = _state_path();
+        let temp = _state_temp_path();
 
         fs::write(&temp, json_str)?;
         fs::rename(&temp, &path)?;
@@ -238,9 +244,11 @@ pub async fn flush_loop(
 // ============================================================================
 
 fn _append_exe_log(event: &BpfEvent, reason: &str) {
-    let log_dir = crate::config::data_dir().join("logs");
-    if fs::create_dir_all(&log_dir).is_err() { return; }
-    let path = log_dir.join("exe.log");
+    let log_dir = crate::config::log_dir();
+    if fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    let path = _exe_log_path();
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let line = format!("{} {:<16} {} (new {})\n", ts, event.name, event.exe, reason);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
@@ -249,9 +257,11 @@ fn _append_exe_log(event: &BpfEvent, reason: &str) {
 }
 
 pub fn log_error(msg: &str) {
-    let log_dir = crate::config::data_dir().join("logs");
-    if fs::create_dir_all(&log_dir).is_err() { return; }
-    let path = log_dir.join("error.log");
+    let log_dir = crate::config::log_dir();
+    if fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    let path = _error_log_path();
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let line = format!("{} {}\n", ts, msg);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
@@ -263,6 +273,33 @@ pub fn log_error(msg: &str) {
 // Helpers
 // ============================================================================
 
+fn _state_path() -> PathBuf {
+    crate::config::data_dir().join("state.json")
+}
+
+fn _state_temp_path() -> PathBuf {
+    crate::config::data_dir().join("state.json.tmp")
+}
+
+fn _exe_log_path() -> PathBuf {
+    crate::config::log_dir().join("exe.log")
+}
+
+fn _error_log_path() -> PathBuf {
+    crate::config::log_dir().join("error.log")
+}
+
+/// Insert value into map[key] if not already present. Returns true if inserted.
+fn _insert_unique(map: &mut HashMap<String, Vec<String>>, key: &str, value: &str) -> bool {
+    let vec = map.entry(key.to_string()).or_default();
+    if !vec.iter().any(|v| v == value) {
+        vec.push(value.to_string());
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests_state {
     use super::*;
@@ -271,18 +308,33 @@ mod tests_state {
 
     fn make_event(exe: &str, name: &str, sha256: &str) -> BpfEvent {
         BpfEvent {
-            pid: 1, ppid: 0, uid: 1000,
-            name: name.to_string(), pname: String::new(),
-            exe: exe.to_string(), pexe: String::new(),
-            cmdline: String::new(), pcmdline: String::new(),
-            fd_path: String::new(), pfd_path: String::new(),
-            dev: 1, ino: 1, pdev: 0, pino: 0,
-            send: 0, recv: 0,
-            lport: 0, rport: 80,
+            pid: 1,
+            ppid: 0,
+            uid: 1000,
+            name: name.to_string(),
+            pname: String::new(),
+            exe: exe.to_string(),
+            pexe: String::new(),
+            cmdline: String::new(),
+            pcmdline: String::new(),
+            fd_path: String::new(),
+            pfd_path: String::new(),
+            dev: 1,
+            ino: 1,
+            pdev: 0,
+            pino: 0,
+            send: 0,
+            recv: 0,
+            lport: 0,
+            rport: 80,
             laddr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             raddr: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             domain: String::new(),
-            sha256: sha256.to_string(), psha256: String::new(),
+            domain_source: "unknown".to_string(),
+            domain_confidence: "none".to_string(),
+            domain_status: "unknown".to_string(),
+            sha256: sha256.to_string(),
+            psha256: String::new(),
             meta: EventMeta::default(),
         }
     }
@@ -363,15 +415,18 @@ mod tests_state {
         state.handle_event(&ev, &seen, &exe_seen);
         assert!(!state.dirty);
     }
-}
 
-/// Insert value into map[key] if not already present. Returns true if inserted.
-fn _insert_unique(map: &mut HashMap<String, Vec<String>>, key: &str, value: &str) -> bool {
-    let vec = map.entry(key.to_string()).or_default();
-    if !vec.iter().any(|v| v == value) {
-        vec.push(value.to_string());
-        true
-    } else {
-        false
+    #[test]
+    fn state_and_log_paths_match_config_owners() {
+        assert_eq!(_state_path(), crate::config::data_dir().join("state.json"));
+        assert_eq!(
+            _state_temp_path(),
+            crate::config::data_dir().join("state.json.tmp")
+        );
+        assert_eq!(_exe_log_path(), crate::config::log_dir().join("exe.log"));
+        assert_eq!(
+            _error_log_path(),
+            crate::config::log_dir().join("error.log")
+        );
     }
 }

@@ -9,10 +9,13 @@
 //! - Extension traits: Sink, EventFilter, RemoteStorage
 //! - NotifyMsg: inter-module communication for state + notify
 
-use std::net::IpAddr;
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
-use peekd_common::{SendRecvEvent, SendRecv6Event, ExecEvent, DnsEvent, DnsEvent6, ConnectEventRaw};
+use peekd_common::{
+    BpfStatEvent, ConnectEventRaw, DnsEvent, DnsEvent6, ExecEvent, SendRecv6Event, SendRecvEvent,
+};
+use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::net::IpAddr;
 
 /// RawEvent: Direct kernel output from perf buffers.
 ///
@@ -31,6 +34,7 @@ pub enum RawEvent {
     Dns(DnsEvent),
     Dns6(DnsEvent6),
     Connect(ConnectEventRaw),
+    BpfStat(BpfStatEvent),
 }
 
 /// EventMeta: Bit-mask encoding discovery flags for a BpfEvent.
@@ -44,13 +48,25 @@ pub enum RawEvent {
 pub struct EventMeta(pub u8);
 
 impl EventMeta {
-    pub const NEW_EXE: u8  = 1 << 0;
+    pub const NEW_EXE: u8 = 1 << 0;
     pub const NEW_HASH: u8 = 1 << 1;
 
-    #[inline(always)] pub fn is_new_exe(self)  -> bool { self.0 & Self::NEW_EXE  != 0 }
-    #[inline(always)] pub fn is_new_hash(self) -> bool { self.0 & Self::NEW_HASH != 0 }
-    #[inline(always)] pub fn set_new_exe(&mut self)  { self.0 |= Self::NEW_EXE; }
-    #[inline(always)] pub fn set_new_hash(&mut self) { self.0 |= Self::NEW_HASH; }
+    #[inline(always)]
+    pub fn is_new_exe(self) -> bool {
+        self.0 & Self::NEW_EXE != 0
+    }
+    #[inline(always)]
+    pub fn is_new_hash(self) -> bool {
+        self.0 & Self::NEW_HASH != 0
+    }
+    #[inline(always)]
+    pub fn set_new_exe(&mut self) {
+        self.0 |= Self::NEW_EXE;
+    }
+    #[inline(always)]
+    pub fn set_new_hash(&mut self) {
+        self.0 |= Self::NEW_HASH;
+    }
 }
 
 /// BpfEvent: Fully resolved event ready for storage/filtering/alerts.
@@ -81,10 +97,28 @@ pub struct BpfEvent {
     pub laddr: IpAddr,
     pub raddr: IpAddr,
     pub domain: String,
-    pub sha256: String,    // resolved by hasher before broadcast
+    #[serde(default = "default_domain_source")]
+    pub domain_source: String,
+    #[serde(default = "default_domain_confidence")]
+    pub domain_confidence: String,
+    #[serde(default = "default_domain_status")]
+    pub domain_status: String,
+    pub sha256: String, // resolved by hasher before broadcast
     pub psha256: String,
     #[serde(default)]
-    pub meta: EventMeta,   // NEW_EXE | NEW_HASH discovery flags
+    pub meta: EventMeta, // NEW_EXE | NEW_HASH discovery flags
+}
+
+fn default_domain_source() -> String {
+    "unknown".to_string()
+}
+
+fn default_domain_confidence() -> String {
+    "none".to_string()
+}
+
+fn default_domain_status() -> String {
+    "unknown".to_string()
 }
 
 #[cfg(test)]
@@ -177,9 +211,13 @@ pub enum NotifyMsg {
 /// Any module that writes events somewhere implements this.
 /// Registered in main.rs, called by broadcast fan-out.
 pub trait Sink: Send + 'static {
-    async fn write(&mut self, batch: &[BpfEvent]) -> Result<(), Box<dyn std::error::Error>>;
-    async fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(())
+    fn write(
+        &mut self,
+        batch: &[BpfEvent],
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
+
+    fn flush(&mut self) -> impl Future<Output = Result<(), Box<dyn std::error::Error>>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -196,5 +234,8 @@ pub trait EventFilter: Send + Sync + 'static {
 /// Future trait for ClickHouse, TimescaleDB, etc.
 /// v1 uses local SQLite (Sink), v2 adds RemoteStorage sink.
 pub trait RemoteStorage: Send + 'static {
-    async fn write_batch(&mut self, rows: &[ConnectionRow]) -> Result<(), Box<dyn std::error::Error>>;
+    fn write_batch(
+        &mut self,
+        rows: &[ConnectionRow],
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
 }

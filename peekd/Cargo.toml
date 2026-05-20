@@ -1,12 +1,11 @@
 [package]
 name = "peekd"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
-peekd-common = { path = "../peekd-common" }
-aya = { workspace = true }
-aya-log = { workspace = true }
+peekd-common = { path = "../peekd-common", features = ["user"] }
+libbpf-rs = { workspace = true }
 tokio = { workspace = true }
 async-stream = { workspace = true }
 futures = { workspace = true }
@@ -26,13 +25,16 @@ glob = "0.3"
 reqwest = { version = "0.11", features = ["json"], optional = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-bytes = "1"
 bytemuck = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 axum = { workspace = true }
 tower-http = { version = "0.5", features = ["fs"] }
+
+[build-dependencies]
+libbpf-cargo = { workspace = true }
+vmlinux = { workspace = true }
 
 [features]
 default = []

@@ -1,13 +1,13 @@
 #![allow(dead_code, unused_imports)]
-use crate::types::BpfEvent;
 use crate::config::Config;
-use tracing::{info, warn, error};
-use std::path::Path;
-use std::collections::HashMap;
-use std::time::{Instant, Duration};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use crate::types::BpfEvent;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AlertRule {
@@ -107,9 +107,7 @@ fn _parse_raw_rule(raw: RawAlertRule) -> anyhow::Result<AlertRule> {
             let url = raw
                 .webhook_url
                 .ok_or_else(|| anyhow::anyhow!("webhook action requires 'webhook_url' field"))?;
-            let method = raw
-                .webhook_method
-                .unwrap_or_else(|| "POST".to_string());
+            let method = raw.webhook_method.unwrap_or_else(|| "POST".to_string());
             AlertAction::Webhook { url, method }
         }
         _ => anyhow::bail!("unknown action: {}", raw.action),
@@ -120,7 +118,11 @@ fn _parse_raw_rule(raw: RawAlertRule) -> anyhow::Result<AlertRule> {
         exe,
         exe_glob,
         domain,
-        rport: if raw.rport == Some(0) { None } else { raw.rport },
+        rport: if raw.rport == Some(0) {
+            None
+        } else {
+            raw.rport
+        },
         rport_not: raw.rport_not,
         sha256,
         on_new_hash: raw.on_new_hash,
@@ -129,12 +131,15 @@ fn _parse_raw_rule(raw: RawAlertRule) -> anyhow::Result<AlertRule> {
 }
 
 fn _matches(rule: &AlertRule, event: &BpfEvent) -> bool {
-    rule.exe.as_deref().map_or(true, |e| event.exe == e)
-        && rule.exe_glob.as_ref().map_or(true, |g| g.matches(&event.exe))
-        && rule.domain.as_ref().map_or(true, |d| event.domain.starts_with(d))
-        && rule.rport.map_or(true, |p| event.rport == p)
+    rule.exe.as_deref().is_none_or(|e| event.exe == e)
+        && rule.exe_glob.as_ref().is_none_or(|g| g.matches(&event.exe))
+        && rule
+            .domain
+            .as_ref()
+            .is_none_or(|d| event.domain.starts_with(d))
+        && rule.rport.is_none_or(|p| event.rport == p)
         && (rule.rport_not.is_empty() || !rule.rport_not.contains(&event.rport))
-        && rule.sha256.as_deref().map_or(true, |s| event.sha256 == s)
+        && rule.sha256.as_deref().is_none_or(|s| event.sha256 == s)
         && (!rule.on_new_hash || event.meta.is_new_hash())
 }
 
@@ -148,8 +153,18 @@ fn _expand_template(template: &str, event: &BpfEvent) -> String {
         .replace("{sha256}", &event.sha256)
 }
 
-async fn _exec_action(cmd: &str, writer_tx: std::sync::mpsc::Sender<crate::storage::WriterMsg>, event: &BpfEvent, rule_name: &str, action_name: &str) {
-    match tokio::process::Command::new("sh").arg("-c").arg(cmd).spawn() {
+async fn _exec_action(
+    cmd: &str,
+    writer_tx: std::sync::mpsc::Sender<crate::storage::WriterMsg>,
+    event: &BpfEvent,
+    rule_name: &str,
+    action_name: &str,
+) {
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .spawn()
+    {
         Ok(mut child) => {
             let writer_tx_clone = writer_tx.clone();
             let event_clone = event.clone();
@@ -288,7 +303,9 @@ pub async fn run(
                     }
 
                     dedup_window.insert(dedup_key, Instant::now());
-                    metrics.alerts_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .alerts_fired
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                     // Fire action in a separate task — never blocks the event loop.
                     // Matching + dedup stay in the main loop (need mutable dedup_window).
@@ -300,7 +317,14 @@ pub async fn run(
                         match &action {
                             AlertAction::Exec(template) => {
                                 let cmd = _expand_template(template, &event_clone);
-                                _exec_action(&cmd, writer_tx_clone, &event_clone, &rule_name_clone, "exec").await;
+                                _exec_action(
+                                    &cmd,
+                                    writer_tx_clone,
+                                    &event_clone,
+                                    &rule_name_clone,
+                                    "exec",
+                                )
+                                .await;
                             }
                             AlertAction::Webhook { url, method } => {
                                 _webhook_action(url, method, &event_clone).await;
@@ -311,7 +335,7 @@ pub async fn run(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 warn!("alert broadcast channel lagged, dropped {} events", n);
-                metrics.events_dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                metrics.record_broadcast_lag("alerts", n);
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 info!("alert broadcast channel closed, exiting");
@@ -329,18 +353,33 @@ mod tests_alerts {
 
     fn make_event(exe: &str, rport: u16, domain: &str, sha256: &str, meta: EventMeta) -> BpfEvent {
         BpfEvent {
-            pid: 1, ppid: 0, uid: 1000,
-            name: "test".to_string(), pname: String::new(),
-            exe: exe.to_string(), pexe: String::new(),
-            cmdline: String::new(), pcmdline: String::new(),
-            fd_path: String::new(), pfd_path: String::new(),
-            dev: 1, ino: 1, pdev: 0, pino: 0,
-            send: 100, recv: 0,
-            lport: 0, rport,
+            pid: 1,
+            ppid: 0,
+            uid: 1000,
+            name: "test".to_string(),
+            pname: String::new(),
+            exe: exe.to_string(),
+            pexe: String::new(),
+            cmdline: String::new(),
+            pcmdline: String::new(),
+            fd_path: String::new(),
+            pfd_path: String::new(),
+            dev: 1,
+            ino: 1,
+            pdev: 0,
+            pino: 0,
+            send: 100,
+            recv: 0,
+            lport: 0,
+            rport,
             laddr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             raddr: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             domain: domain.to_string(),
-            sha256: sha256.to_string(), psha256: String::new(),
+            domain_source: "unknown".to_string(),
+            domain_confidence: "none".to_string(),
+            domain_status: "unknown".to_string(),
+            sha256: sha256.to_string(),
+            psha256: String::new(),
             meta,
         }
     }
@@ -362,7 +401,13 @@ mod tests_alerts {
     #[test]
     fn rule_matches_any_event_when_no_conditions() {
         let rule = make_rule(false, None, None);
-        let ev = make_event("/usr/bin/curl", 443, "example.com", "abc", EventMeta::default());
+        let ev = make_event(
+            "/usr/bin/curl",
+            443,
+            "example.com",
+            "abc",
+            EventMeta::default(),
+        );
         assert!(_matches(&rule, &ev));
     }
 
@@ -392,7 +437,7 @@ mod tests_alerts {
     fn rport_filter_exact_match() {
         let rule = make_rule(false, Some(443), None);
         let ev_match = make_event("/usr/bin/curl", 443, "", "abc", EventMeta::default());
-        let ev_miss  = make_event("/usr/bin/curl", 80,  "", "abc", EventMeta::default());
+        let ev_miss = make_event("/usr/bin/curl", 80, "", "abc", EventMeta::default());
         assert!(_matches(&rule, &ev_match));
         assert!(!_matches(&rule, &ev_miss));
     }
@@ -401,7 +446,7 @@ mod tests_alerts {
     fn exe_filter_exact_match() {
         let rule = make_rule(false, None, Some("/usr/bin/curl"));
         let ev_match = make_event("/usr/bin/curl", 443, "", "abc", EventMeta::default());
-        let ev_miss  = make_event("/usr/bin/wget", 443, "", "abc", EventMeta::default());
+        let ev_miss = make_event("/usr/bin/wget", 443, "", "abc", EventMeta::default());
         assert!(_matches(&rule, &ev_match));
         assert!(!_matches(&rule, &ev_miss));
     }
@@ -412,5 +457,28 @@ mod tests_alerts {
         rule.rport_not = vec![443];
         let ev = make_event("/usr/bin/curl", 443, "", "abc", EventMeta::default());
         assert!(!_matches(&rule, &ev));
+    }
+
+    #[test]
+    fn domain_filter_matches_canonical_tld_first_prefix() {
+        let mut rule = make_rule(false, None, None);
+        rule.domain = Some("com.example".to_string());
+        let ev_match = make_event(
+            "/usr/bin/curl",
+            443,
+            "com.example.www",
+            "abc",
+            EventMeta::default(),
+        );
+        let ev_miss = make_event(
+            "/usr/bin/curl",
+            443,
+            "org.example.www",
+            "abc",
+            EventMeta::default(),
+        );
+
+        assert!(_matches(&rule, &ev_match));
+        assert!(!_matches(&rule, &ev_miss));
     }
 }

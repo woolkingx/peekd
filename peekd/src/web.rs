@@ -8,21 +8,30 @@
 //!   GET /api/top    → JSON: top destinations with per-exe breakdown
 
 use anyhow::Result;
-use axum::{Router, extract::{Query, State}, response::{Html, Json}, routing::{get, post}};
-use rusqlite::{Connection, params};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{Html, Json},
+    routing::{get, post},
+    Router,
+};
+use lru::LruCache;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use lru::LruCache;
+
+const MAX_WEB_TOP_LIMIT: u32 = 1_000;
+const MAX_WEB_CONNECTION_LIMIT: u32 = 5_000;
 
 #[derive(Clone)]
 struct AppState {
-    top_limit:       u32,
+    top_limit: u32,
     refresh_seconds: u64,
-    default_since:   String,
+    default_since: String,
 }
 
 // PTR lookup cache: ip string → hostname (empty = no record), max 10k entries
@@ -64,11 +73,16 @@ async fn lookup_ptr(ip: &str) -> String {
 }
 
 fn _is_private(ip: &str) -> bool {
-    let Ok(addr) = IpAddr::from_str(ip) else { return false };
+    let Ok(addr) = IpAddr::from_str(ip) else {
+        return false;
+    };
     match addr {
         IpAddr::V4(a) => {
             let o = a.octets();
-            matches!(o, [10, ..] | [172, 16..=31, ..] | [192, 168, ..] | [127, ..])
+            matches!(
+                o,
+                [10, ..] | [172, 16..=31, ..] | [192, 168, ..] | [127, ..]
+            )
         }
         IpAddr::V6(a) => a.is_loopback(),
     }
@@ -77,18 +91,21 @@ fn _is_private(ip: &str) -> bool {
 async fn _do_whois_lookup(ip: &str) -> String {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        tokio::process::Command::new("whois")
-            .arg(ip)
-            .output()
-    ).await;
-    let Ok(Ok(out)) = out else { return String::new() };
+        tokio::process::Command::new("whois").arg(ip).output(),
+    )
+    .await;
+    let Ok(Ok(out)) = out else {
+        return String::new();
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     for field in &["OrgName", "org-name", "netname", "Organization", "owner"] {
         for line in text.lines() {
             if line.to_lowercase().starts_with(&field.to_lowercase()) {
-                if let Some(val) = line.splitn(2, ':').nth(1) {
+                if let Some((_, val)) = line.split_once(':') {
                     let v = val.trim().to_string();
-                    if !v.is_empty() { return v; }
+                    if !v.is_empty() {
+                        return v;
+                    }
                 }
             }
         }
@@ -97,7 +114,9 @@ async fn _do_whois_lookup(ip: &str) -> String {
 }
 
 async fn _do_ptr_lookup(ip: &str) -> String {
-    let Ok(addr) = IpAddr::from_str(ip) else { return String::new() };
+    let Ok(addr) = IpAddr::from_str(ip) else {
+        return String::new();
+    };
     tokio::task::spawn_blocking(move || _getnameinfo(&addr))
         .await
         .unwrap_or_default()
@@ -110,7 +129,9 @@ fn _getnameinfo(addr: &IpAddr) -> String {
             let sa = libc::sockaddr_in {
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: 0,
-                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) },
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.octets()),
+                },
                 sin_zero: [0; 8],
             };
             unsafe {
@@ -119,7 +140,8 @@ fn _getnameinfo(addr: &IpAddr) -> String {
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                     host.as_mut_ptr() as *mut libc::c_char,
                     host.len() as libc::socklen_t,
-                    std::ptr::null_mut(), 0,
+                    std::ptr::null_mut(),
+                    0,
                     libc::NI_NAMEREQD,
                 )
             }
@@ -129,7 +151,9 @@ fn _getnameinfo(addr: &IpAddr) -> String {
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: 0,
                 sin6_flowinfo: 0,
-                sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.octets(),
+                },
                 sin6_scope_id: 0,
             };
             unsafe {
@@ -138,13 +162,16 @@ fn _getnameinfo(addr: &IpAddr) -> String {
                     std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
                     host.as_mut_ptr() as *mut libc::c_char,
                     host.len() as libc::socklen_t,
-                    std::ptr::null_mut(), 0,
+                    std::ptr::null_mut(),
+                    0,
                     libc::NI_NAMEREQD,
                 )
             }
         }
     };
-    if ret != 0 { return String::new(); }
+    if ret != 0 {
+        return String::new();
+    }
     let end = host.iter().position(|&b| b == 0).unwrap_or(host.len());
     String::from_utf8_lossy(&host[..end]).into_owned()
 }
@@ -154,46 +181,46 @@ static HTML: &str = include_str!("web.html");
 #[derive(Deserialize)]
 struct DataParams {
     since: Option<String>,
-    dim:   Option<String>,
-    from:  Option<i64>,
-    to:    Option<i64>,
+    dim: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 #[derive(Serialize)]
 struct DataRow {
     label: String,
-    send:  i64,
-    recv:  i64,
+    send: i64,
+    recv: i64,
     flows: i64,
 }
 
 #[derive(Serialize)]
 struct DataResp {
-    dim:   String,
+    dim: String,
     since: String,
-    rows:  Vec<DataRow>,
+    rows: Vec<DataRow>,
 }
 
 #[derive(Serialize, Clone)]
 struct DestSub {
-    name:   String,
-    uid:    i64,
-    rport:  i64,
+    name: String,
+    uid: i64,
+    rport: i64,
     domain: String,
-    flows:  i64,
-    send:   i64,
-    recv:   i64,
+    flows: i64,
+    send: i64,
+    recv: i64,
 }
 
 #[derive(Serialize)]
 struct Dest {
-    label:    String,
-    domain:   String,
+    label: String,
+    domain: String,
     hostname: String,
-    flows:    i64,
-    send:     i64,
-    recv:     i64,
-    subs:     Vec<DestSub>,
+    flows: i64,
+    send: i64,
+    recv: i64,
+    subs: Vec<DestSub>,
 }
 
 #[derive(Serialize)]
@@ -204,30 +231,30 @@ struct TopResp {
 
 #[derive(Serialize)]
 struct HourRow {
-    hour:  String,
+    hour: String,
     flows: i64,
     bytes: i64,
 }
 
 #[derive(Serialize)]
 struct SummaryResp {
-    since:      String,
-    flows:      i64,
-    send:       i64,
-    recv:       i64,
+    since: String,
+    flows: i64,
+    send: i64,
+    recv: i64,
     unique_ips: i64,
-    hours:      Vec<HourRow>,
+    hours: Vec<HourRow>,
 }
 
 fn db() -> Result<Connection> {
-    let path = crate::config::db_path();
-    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
-    Ok(conn)
+    crate::storage::open_query_db().map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 fn get_from_to(since: Option<&str>, from: Option<i64>, to: Option<i64>) -> (i64, i64) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let to_ts = to.unwrap_or(now);
 
     let from_ts = if let Some(f) = from {
@@ -235,11 +262,11 @@ fn get_from_to(since: Option<&str>, from: Option<i64>, to: Option<i64>) -> (i64,
     } else {
         let since_str = since.unwrap_or("24h");
         let secs: i64 = match since_str {
-            "1h"  => 3600,
-            "6h"  => 21600,
-            "7d"  => 604800,
+            "1h" => 3600,
+            "6h" => 21600,
+            "7d" => 604800,
             "30d" => 2592000,
-            _     => 86400,
+            _ => 86400,
         };
         to_ts - secs
     };
@@ -249,79 +276,149 @@ fn get_from_to(since: Option<&str>, from: Option<i64>, to: Option<i64>) -> (i64,
 
 fn dim_sql(dim: &str) -> &'static str {
     match dim {
-        "name"    => "e.name",
+        "name" => "e.name",
         "cmdline" => "e.cmdline",
-        "raddr"   => "c.raddr",
-        "domain"  => "c.domain",
-        "rport"   => "CAST(c.rport AS TEXT)",
-        "uid"     => "CAST(c.uid AS TEXT)",
-        _         => "e.exe",
+        "raddr" => "c.raddr",
+        "domain" => "c.domain",
+        "rport" => "CAST(c.rport AS TEXT)",
+        "uid" => "CAST(c.uid AS TEXT)",
+        _ => "e.exe",
     }
 }
 
-async fn api_data(Query(p): Query<DataParams>) -> Json<DataResp> {
-    let (from_ts, _to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
-    let since = p.since.unwrap_or_else(|| "24h".into());
-    let dim   = p.dim.unwrap_or_else(|| "exe".into());
-    let col   = dim_sql(&dim).to_string();
-
-    let rows = tokio::task::spawn_blocking(move || {
-        (|| -> Result<Vec<DataRow>> {
-            let conn = db()?;
-            let sql = format!(
-                "SELECT {col} AS label, COALESCE(SUM(c.send),0), COALESCE(SUM(c.recv),0), COUNT(*)
-                 FROM connections c JOIN executables e ON c.exe_id = e.id
-                 WHERE c.contime >= ?1
-                 GROUP BY label ORDER BY SUM(c.send+c.recv) DESC LIMIT 50"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![from_ts], |r| {
-                Ok(DataRow { label: r.get::<_,String>(0).unwrap_or_default(), send: r.get(1)?, recv: r.get(2)?, flows: r.get(3)? })
-            })?.filter_map(|r| r.ok()).collect();
-            Ok(rows)
-        })()
-    })
-    .await
-    .unwrap_or(Err(anyhow::anyhow!("spawn_blocking failed")))
-    .unwrap_or_default();
-
-    Json(DataResp { dim, since, rows })
+fn clamp_limit(limit: u32, max: u32) -> Option<u32> {
+    if limit == 0 {
+        None
+    } else {
+        Some(limit.min(max).max(1))
+    }
 }
 
-async fn api_top(State(state): State<AppState>, Query(p): Query<DataParams>) -> Json<TopResp> {
-    let (from_ts, _to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
-    let since  = p.since.unwrap_or_else(|| "24h".into());
-    let dim    = p.dim.unwrap_or_else(|| "raddr".into());
-    let col    = dim_sql(&dim).to_string();
+fn limit_sql(limit: Option<u32>) -> String {
+    limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default()
+}
+
+fn operator_error(code: &str, message: impl ToString) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message.to_string(),
+        }
+    })
+}
+
+type WebError = (StatusCode, Json<serde_json::Value>);
+
+fn web_error(code: &str, message: impl ToString) -> WebError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(operator_error(code, message)),
+    )
+}
+
+async fn db_task<T>(
+    task: tokio::task::JoinHandle<Result<T>>,
+    code: &'static str,
+) -> Result<T, WebError> {
+    match task.await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            tracing::error!(code, error = %e, "web api failed");
+            Err(web_error(code, e.to_string()))
+        }
+        Err(e) => {
+            tracing::error!(code = "worker_failed", error = %e, "web api worker failed");
+            Err(web_error("worker_failed", e.to_string()))
+        }
+    }
+}
+
+fn collect_rows<T, I>(rows: I) -> Result<Vec<T>>
+where
+    I: IntoIterator<Item = rusqlite::Result<T>>,
+{
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row?);
+    }
+    Ok(values)
+}
+
+async fn api_data(Query(p): Query<DataParams>) -> Result<Json<DataResp>, WebError> {
+    let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
+    let since = p.since.unwrap_or_else(|| "24h".into());
+    let dim = p.dim.unwrap_or_else(|| "exe".into());
+    let col = dim_sql(&dim).to_string();
+
+    let rows = db_task(
+        tokio::task::spawn_blocking(move || {
+            (|| -> Result<Vec<DataRow>> {
+                let conn = db()?;
+                let sql = format!(
+                "SELECT {col} AS label, COALESCE(SUM(c.send),0), COALESCE(SUM(c.recv),0), COUNT(*)
+                 FROM connections c JOIN executables e ON c.exe_id = e.id
+                 WHERE c.contime >= ?1 AND c.contime <= ?2
+                 GROUP BY label ORDER BY SUM(c.send+c.recv) DESC LIMIT 50"
+            );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![from_ts, to_ts], |r| {
+                    Ok(DataRow {
+                        label: r.get(0)?,
+                        send: r.get(1)?,
+                        recv: r.get(2)?,
+                        flows: r.get(3)?,
+                    })
+                })?;
+                collect_rows(rows)
+            })()
+        }),
+        "data_query_failed",
+    )
+    .await?;
+
+    Ok(Json(DataResp { dim, since, rows }))
+}
+
+async fn api_top(
+    State(state): State<AppState>,
+    Query(p): Query<DataParams>,
+) -> Result<Json<TopResp>, WebError> {
+    let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
+    let since = p.since.unwrap_or_else(|| "24h".into());
+    let dim = p.dim.unwrap_or_else(|| "raddr".into());
+    let col = dim_sql(&dim).to_string();
     let by_raddr = dim == "raddr";
-    let limit  = state.top_limit;
+    let limit = clamp_limit(state.top_limit, MAX_WEB_TOP_LIMIT);
+    let limit_clause = limit_sql(limit);
 
     type RawDest = (String, String, i64, i64, i64, Vec<DestSub>);
-    let raw: Vec<RawDest> = tokio::task::spawn_blocking(move || {
+    let raw: Vec<RawDest> = db_task(tokio::task::spawn_blocking(move || {
         (|| -> Result<Vec<RawDest>> {
             let conn = db()?;
             let domain_col = if by_raddr { "COALESCE(c.domain,'')" } else { "''" };
             let sql = format!(
                 "SELECT {col} AS label, {domain_col}, COUNT(*), COALESCE(SUM(c.send),0), COALESCE(SUM(c.recv),0)
                  FROM connections c JOIN executables e ON c.exe_id = e.id
-                 WHERE c.contime >= ?1
-                 GROUP BY label ORDER BY SUM(c.send+c.recv) DESC LIMIT {limit}"
+                 WHERE c.contime >= ?1 AND c.contime <= ?2
+                 GROUP BY label ORDER BY SUM(c.send+c.recv) DESC{limit_clause}"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let dests_raw: Vec<(String, String, i64, i64, i64)> = stmt.query_map(params![from_ts], |r| {
+            let dest_rows = stmt.query_map(params![from_ts, to_ts], |r| {
                 Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?, r.get::<_,i64>(4)?))
-            })?.filter_map(|r| r.ok()).collect();
+            })?;
+            let dests_raw: Vec<(String, String, i64, i64, i64)> = collect_rows(dest_rows)?;
 
             if by_raddr {
                 // Single JOIN query for all raddr subs, group in Rust
                 let mut sub_stmt = conn.prepare(
                     "SELECT c.raddr, e.name, c.uid, c.rport, COUNT(*), COALESCE(SUM(c.send),0), COALESCE(SUM(c.recv),0)
                      FROM connections c JOIN executables e ON c.exe_id = e.id
-                     WHERE c.contime >= ?1
+                     WHERE c.contime >= ?1 AND c.contime <= ?2
                      GROUP BY c.raddr, e.name, c.uid, c.rport"
                 )?;
                 let mut subs_by_raddr: std::collections::HashMap<String, Vec<DestSub>> = HashMap::new();
-                sub_stmt.query_map(params![from_ts], |r| {
+                let sub_rows = sub_stmt.query_map(params![from_ts, to_ts], |r| {
                     let raddr = r.get::<_,String>(0)?;
                     let sub = DestSub {
                         name: r.get(1)?,
@@ -332,9 +429,11 @@ async fn api_top(State(state): State<AppState>, Query(p): Query<DataParams>) -> 
                         send: r.get(5)?,
                         recv: r.get(6)?,
                     };
-                    subs_by_raddr.entry(raddr).or_insert_with(Vec::new).push(sub);
-                    Ok(())
-                })?.for_each(|_| ());
+                    Ok((raddr, sub))
+                })?;
+                for (raddr, sub) in collect_rows(sub_rows)? {
+                    subs_by_raddr.entry(raddr).or_default().push(sub);
+                }
 
                 // Sort each vec by send+recv DESC
                 for subs in subs_by_raddr.values_mut() {
@@ -348,63 +447,73 @@ async fn api_top(State(state): State<AppState>, Query(p): Query<DataParams>) -> 
                 Ok(rows)
             } else {
                 // Non-raddr path: keep the original per-destination queries
-                let rows: Vec<RawDest> = dests_raw.into_iter().map(|(label, domain, flows, send, recv)| {
+                let mut rows = Vec::new();
+                for (label, domain, flows, send, recv) in dests_raw {
                     let sub_sql = format!(
                         "SELECT c.raddr, COALESCE(c.domain,''), COUNT(*), COALESCE(SUM(c.send),0), COALESCE(SUM(c.recv),0)
                          FROM connections c JOIN executables e ON c.exe_id = e.id
-                         WHERE c.contime >= ?1 AND {col} = ?2
+                         WHERE c.contime >= ?1 AND c.contime <= ?2 AND {col} = ?3
                          GROUP BY c.raddr ORDER BY SUM(c.send+c.recv) DESC LIMIT 10"
                     );
-                    let subs: Vec<DestSub> = if let Ok(mut s) = conn.prepare(&sub_sql) {
-                        s.query_map(params![from_ts, &label], |r| {
+                    let mut s = conn.prepare(&sub_sql)?;
+                    let sub_rows = s.query_map(params![from_ts, to_ts, &label], |r| {
                             Ok(DestSub { name: r.get(0)?, uid: 0, rport: 0, domain: r.get(1)?, flows: r.get(2)?, send: r.get(3)?, recv: r.get(4)? })
-                        }).ok().map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    (label, domain, flows, send, recv, subs)
-                }).collect();
+                    })?;
+                    let subs: Vec<DestSub> = collect_rows(sub_rows)?;
+                    rows.push((label, domain, flows, send, recv, subs));
+                }
                 Ok(rows)
             }
         })()
-    })
-    .await
-    .unwrap_or(Err(anyhow::anyhow!("spawn_blocking failed")))
-    .unwrap_or_default();
+    }), "top_query_failed").await?;
 
     let mut dests = Vec::with_capacity(raw.len());
     if by_raddr {
-        let hostnames = futures::future::join_all(
-            raw.iter().map(|(label, ..)| lookup_ptr(label))
-        ).await;
+        let hostnames =
+            futures::future::join_all(raw.iter().map(|(label, ..)| lookup_ptr(label))).await;
         for ((label, domain, flows, send, recv, subs), hostname) in raw.into_iter().zip(hostnames) {
-            dests.push(Dest { label, domain, hostname, flows, send, recv, subs });
+            dests.push(Dest {
+                label,
+                domain,
+                hostname,
+                flows,
+                send,
+                recv,
+                subs,
+            });
         }
     } else {
         for (label, domain, flows, send, recv, subs) in raw {
-            dests.push(Dest { label, domain, hostname: String::new(), flows, send, recv, subs });
+            dests.push(Dest {
+                label,
+                domain,
+                hostname: String::new(),
+                flows,
+                send,
+                recv,
+                subs,
+            });
         }
     }
 
-    Json(TopResp { since, dests })
+    Ok(Json(TopResp { since, dests }))
 }
 
-async fn api_summary(Query(p): Query<DataParams>) -> Json<SummaryResp> {
+async fn api_summary(Query(p): Query<DataParams>) -> Result<Json<SummaryResp>, WebError> {
     let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
     let since = p.since.unwrap_or_else(|| "24h".into());
     let span = to_ts - from_ts;
-    let since_clone = since.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = db_task(tokio::task::spawn_blocking(move || {
         (|| -> Result<SummaryResp> {
             let conn = db()?;
             let (flows, send, recv): (i64, i64, i64) = conn.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(send),0), COALESCE(SUM(recv),0) FROM connections WHERE contime >= ?1",
-                params![from_ts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                "SELECT COUNT(*), COALESCE(SUM(send),0), COALESCE(SUM(recv),0) FROM connections WHERE contime >= ?1 AND contime <= ?2",
+                params![from_ts, to_ts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             )?;
             let unique_ips: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT raddr) FROM connections WHERE contime >= ?1",
-                params![from_ts], |r| r.get(0)
+                "SELECT COUNT(DISTINCT raddr) FROM connections WHERE contime >= ?1 AND contime <= ?2",
+                params![from_ts, to_ts], |r| r.get(0)
             )?;
             // Auto-detect bucket granularity based on span
             let time_sql = if span < 7200 {
@@ -419,25 +528,23 @@ async fn api_summary(Query(p): Query<DataParams>) -> Json<SummaryResp> {
             };
             let sql = format!(
                 "SELECT {time_sql} AS bucket, COUNT(*), COALESCE(SUM(send+recv),0)
-                 FROM connections WHERE contime >= ?1 GROUP BY bucket ORDER BY bucket"
+                 FROM connections WHERE contime >= ?1 AND contime <= ?2 GROUP BY bucket ORDER BY bucket"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let hours: Vec<HourRow> = stmt.query_map(params![from_ts], |r| {
+            let hour_rows = stmt.query_map(params![from_ts, to_ts], |r| {
                 Ok(HourRow { hour: r.get(0)?, flows: r.get(1)?, bytes: r.get(2)? })
-            })?.filter_map(|r| r.ok()).collect();
+            })?;
+            let hours: Vec<HourRow> = collect_rows(hour_rows)?;
             Ok(SummaryResp { since: since.clone(), flows, send, recv, unique_ips, hours })
         })()
-    })
-    .await
-    .unwrap_or(Err(anyhow::anyhow!("spawn_blocking failed")))
-    .unwrap_or(SummaryResp { since: since_clone, flows: 0, send: 0, recv: 0, unique_ips: 0, hours: vec![] });
+    }), "summary_query_failed").await?;
 
-    Json(result)
+    Ok(Json(result))
 }
 
-async fn api_alerts(Query(p): Query<DataParams>) -> Json<serde_json::Value> {
+async fn api_alerts(Query(p): Query<DataParams>) -> Result<Json<serde_json::Value>, WebError> {
     let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
-    let rows = tokio::task::spawn_blocking(move || {
+    let rows = db_task(tokio::task::spawn_blocking(move || {
         (|| -> Result<Vec<serde_json::Value>> {
             let conn = db()?;
             let mut stmt = conn.prepare(
@@ -452,30 +559,33 @@ async fn api_alerts(Query(p): Query<DataParams>) -> Json<serde_json::Value> {
                     "domain": r.get::<_,String>(4)?,
                     "action": r.get::<_,String>(5)?,
                 }))
-            })?.filter_map(|r| r.ok()).collect();
-            Ok(rows)
+            })?;
+            collect_rows(rows)
         })()
-    }).await.unwrap_or(Ok(vec![])).unwrap_or_default();
-    Json(serde_json::json!({"events": rows}))
+    }), "alerts_query_failed").await?;
+    Ok(Json(serde_json::json!({"events": rows})))
 }
 
 #[derive(Deserialize)]
 struct ConnParams {
-    exe:   Option<String>,
+    exe: Option<String>,
     raddr: Option<String>,
-    from:  Option<i64>,
-    to:    Option<i64>,
+    from: Option<i64>,
+    to: Option<i64>,
     since: Option<String>,
     limit: Option<u32>,
 }
 
-async fn api_connections(Query(p): Query<ConnParams>) -> Json<serde_json::Value> {
+async fn api_connections(Query(p): Query<ConnParams>) -> Result<Json<serde_json::Value>, WebError> {
     let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
-    let limit = p.limit.unwrap_or(200);
-    let exe   = p.exe.clone();
+    let limit_clause = limit_sql(clamp_limit(
+        p.limit.unwrap_or(200),
+        MAX_WEB_CONNECTION_LIMIT,
+    ));
+    let exe = p.exe.clone();
     let raddr = p.raddr.clone();
 
-    let rows = tokio::task::spawn_blocking(move || {
+    let rows = db_task(tokio::task::spawn_blocking(move || {
         (|| -> Result<Vec<serde_json::Value>> {
             let conn = db()?;
             // Build WHERE conditions
@@ -499,16 +609,16 @@ async fn api_connections(Query(p): Query<ConnParams>) -> Json<serde_json::Value>
             };
 
             let sql = format!(
-                "SELECT c.contime, e.exe, e.name, c.raddr, COALESCE(c.domain,''), c.rport, c.lport, c.uid, COALESCE(c.send,0), COALESCE(c.recv,0), COALESCE(e.exe,'')
+                "SELECT c.contime, e.exe, e.name, c.raddr, COALESCE(c.domain,''), c.rport, c.lport, c.uid, COALESCE(c.send,0), COALESCE(c.recv,0), COALESCE(e.exe,''), c.domain_source, c.domain_confidence, c.domain_status
                  FROM connections c JOIN executables e ON c.exe_id = e.id
-                 {} ORDER BY c.contime DESC LIMIT {}", where_clause, limit
+                 {} ORDER BY c.contime DESC{}", where_clause, limit_clause
             );
 
             let mut stmt = conn.prepare(&sql)?;
             let rows = match bind_count {
                 4 => {
                     let exe_pat = format!("%{}%", exe.as_ref().unwrap());
-                    stmt.query_map(params![from_ts, to_ts, exe_pat, raddr.as_ref().unwrap()], |r| {
+                    collect_rows(stmt.query_map(params![from_ts, to_ts, exe_pat, raddr.as_ref().unwrap()], |r| {
                         Ok(serde_json::json!({
                             "ts":     r.get::<_,i64>(0)?,
                             "exe":    r.get::<_,String>(1)?,
@@ -521,13 +631,16 @@ async fn api_connections(Query(p): Query<ConnParams>) -> Json<serde_json::Value>
                             "send":   r.get::<_,i64>(8)?,
                             "recv":   r.get::<_,i64>(9)?,
                             "pexe":   r.get::<_,String>(10)?,
+                            "domain_source": r.get::<_,String>(11)?,
+                            "domain_confidence": r.get::<_,String>(12)?,
+                            "domain_status": r.get::<_,String>(13)?,
                         }))
-                    })?.filter_map(|r| r.ok()).collect()
+                    })?)
                 },
                 3 => {
-                    if exe.is_some() {
-                        let exe_pat = format!("%{}%", exe.as_ref().unwrap());
-                        stmt.query_map(params![from_ts, to_ts, exe_pat], |r| {
+                    if let Some(exe) = &exe {
+                        let exe_pat = format!("%{}%", exe);
+                        collect_rows(stmt.query_map(params![from_ts, to_ts, exe_pat], |r| {
                             Ok(serde_json::json!({
                                 "ts":     r.get::<_,i64>(0)?,
                                 "exe":    r.get::<_,String>(1)?,
@@ -540,10 +653,13 @@ async fn api_connections(Query(p): Query<ConnParams>) -> Json<serde_json::Value>
                                 "send":   r.get::<_,i64>(8)?,
                                 "recv":   r.get::<_,i64>(9)?,
                                 "pexe":   r.get::<_,String>(10)?,
+                                "domain_source": r.get::<_,String>(11)?,
+                                "domain_confidence": r.get::<_,String>(12)?,
+                                "domain_status": r.get::<_,String>(13)?,
                             }))
-                        })?.filter_map(|r| r.ok()).collect()
+                        })?)
                     } else {
-                        stmt.query_map(params![from_ts, to_ts, raddr.as_ref().unwrap()], |r| {
+                        collect_rows(stmt.query_map(params![from_ts, to_ts, raddr.as_ref().unwrap()], |r| {
                             Ok(serde_json::json!({
                                 "ts":     r.get::<_,i64>(0)?,
                                 "exe":    r.get::<_,String>(1)?,
@@ -556,12 +672,15 @@ async fn api_connections(Query(p): Query<ConnParams>) -> Json<serde_json::Value>
                                 "send":   r.get::<_,i64>(8)?,
                                 "recv":   r.get::<_,i64>(9)?,
                                 "pexe":   r.get::<_,String>(10)?,
+                                "domain_source": r.get::<_,String>(11)?,
+                                "domain_confidence": r.get::<_,String>(12)?,
+                                "domain_status": r.get::<_,String>(13)?,
                             }))
-                        })?.filter_map(|r| r.ok()).collect()
+                        })?)
                     }
                 },
                 _ => {
-                    stmt.query_map(params![from_ts, to_ts], |r| {
+                    collect_rows(stmt.query_map(params![from_ts, to_ts], |r| {
                         Ok(serde_json::json!({
                             "ts":     r.get::<_,i64>(0)?,
                             "exe":    r.get::<_,String>(1)?,
@@ -574,25 +693,31 @@ async fn api_connections(Query(p): Query<ConnParams>) -> Json<serde_json::Value>
                             "send":   r.get::<_,i64>(8)?,
                             "recv":   r.get::<_,i64>(9)?,
                             "pexe":   r.get::<_,String>(10)?,
+                            "domain_source": r.get::<_,String>(11)?,
+                            "domain_confidence": r.get::<_,String>(12)?,
+                            "domain_status": r.get::<_,String>(13)?,
                         }))
-                    })?.filter_map(|r| r.ok()).collect()
+                    })?)
                 },
-            };
+            }?;
             Ok(rows)
         })()
-    }).await.unwrap_or(Ok(vec![])).unwrap_or_default();
+    }), "connections_query_failed").await?;
 
-    Json(serde_json::json!({"connections": rows}))
+    Ok(Json(serde_json::json!({"connections": rows})))
 }
 
-async fn api_timeseries(State(state): State<AppState>, Query(p): Query<DataParams>) -> Json<serde_json::Value> {
+async fn api_timeseries(
+    State(state): State<AppState>,
+    Query(p): Query<DataParams>,
+) -> Result<Json<serde_json::Value>, WebError> {
     let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
     let dim = p.dim.unwrap_or_else(|| "exe".into());
     let col = dim_sql(&dim).to_string();
     let span = to_ts - from_ts;
     let _limit = state.top_limit;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = db_task(tokio::task::spawn_blocking(move || {
         (|| -> Result<serde_json::Value> {
             let conn = db()?;
             // Auto-detect bucket granularity
@@ -612,18 +737,20 @@ async fn api_timeseries(State(state): State<AppState>, Query(p): Query<DataParam
                  GROUP BY label ORDER BY total DESC LIMIT 8"
             );
             let mut stmt = conn.prepare(&top_sql)?;
-            let top_labels: Vec<String> = stmt.query_map(params![from_ts, to_ts], |r| {
+            let label_rows = stmt.query_map(params![from_ts, to_ts], |r| {
                 r.get::<_,String>(0)
-            })?.filter_map(|r| r.ok()).collect();
+            })?;
+            let top_labels: Vec<String> = collect_rows(label_rows)?;
 
             // Get all buckets
             let bucket_sql = format!(
                 "SELECT DISTINCT {time_sql} AS bucket FROM connections WHERE contime >= ?1 AND contime <= ?2 ORDER BY bucket"
             );
             let mut stmt2 = conn.prepare(&bucket_sql)?;
-            let buckets: Vec<String> = stmt2.query_map(params![from_ts, to_ts], |r| {
+            let bucket_rows = stmt2.query_map(params![from_ts, to_ts], |r| {
                 r.get::<_,String>(0)
-            })?.filter_map(|r| r.ok()).collect();
+            })?;
+            let buckets: Vec<String> = collect_rows(bucket_rows)?;
 
             // For each top label, get bytes per bucket
             let mut series = vec![];
@@ -635,72 +762,98 @@ async fn api_timeseries(State(state): State<AppState>, Query(p): Query<DataParam
                      GROUP BY bucket"
                 );
                 let mut data_stmt = conn.prepare(&data_sql)?;
-                let data_map: std::collections::HashMap<String,i64> = data_stmt.query_map(params![from_ts, to_ts, label], |r| {
+                let data_rows = data_stmt.query_map(params![from_ts, to_ts, label], |r| {
                     Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?))
-                })?.filter_map(|r| r.ok()).collect();
+                })?;
+                let data_map: std::collections::HashMap<String,i64> =
+                    collect_rows(data_rows)?.into_iter().collect();
                 let data: Vec<i64> = buckets.iter().map(|b| data_map.get(b).copied().unwrap_or(0)).collect();
                 series.push(serde_json::json!({"label": label, "data": data}));
             }
 
             Ok(serde_json::json!({"buckets": buckets, "series": series}))
         })()
-    }).await.unwrap_or(Ok(serde_json::json!({"buckets":[],"series":[]}))).unwrap_or(serde_json::json!({"buckets":[],"series":[]}));
+    }), "timeseries_query_failed").await?;
 
-    Json(result)
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]
-struct IgnoreReq { kind: String, value: String }
+struct IgnoreReq {
+    kind: String,
+    value: String,
+}
 
-async fn api_ignore(axum::Json(body): axum::Json<IgnoreReq>) -> Json<serde_json::Value> {
+async fn api_ignore(
+    axum::Json(body): axum::Json<IgnoreReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let kind = body.kind.clone();
     let value = body.value.clone();
     // Validate kind
     if !["exe", "domain", "raddr"].contains(&kind.as_str()) {
-        return Json(serde_json::json!({"ok": false, "error": "invalid kind"}));
+        tracing::warn!(kind, "invalid web ignore kind");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(operator_error("invalid_ignore_kind", "invalid kind")),
+        );
     }
     let config_dir = crate::config::config_dir();
     match crate::filter::save_extra_ignore(&config_dir, &kind, &value) {
-        Ok(_) => Json(serde_json::json!({"ok": true})),
-        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Err(e) => {
+            tracing::error!(kind, value, error = %e, "web ignore write failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(operator_error("ignore_write_failed", e.to_string())),
+            )
+        }
     }
 }
 
-async fn api_export(Query(p): Query<DataParams>) -> impl axum::response::IntoResponse {
-    let (from_ts, _to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
+async fn api_export(
+    Query(p): Query<DataParams>,
+) -> Result<impl axum::response::IntoResponse, WebError> {
+    let (from_ts, to_ts) = get_from_to(p.since.as_deref(), p.from, p.to);
     let dim = p.dim.unwrap_or_else(|| "exe".into());
     let col = dim_sql(&dim).to_string();
 
-    let csv = tokio::task::spawn_blocking(move || {
-        (|| -> Result<String> {
-            let conn = db()?;
-            let sql = format!(
+    let csv = db_task(
+        tokio::task::spawn_blocking(move || {
+            (|| -> Result<String> {
+                let conn = db()?;
+                let sql = format!(
                 "SELECT {col} AS label, COALESCE(SUM(c.send),0), COALESCE(SUM(c.recv),0), COUNT(*)
                  FROM connections c JOIN executables e ON c.exe_id = e.id
-                 WHERE c.contime >= ?1
+                 WHERE c.contime >= ?1 AND c.contime <= ?2
                  GROUP BY label ORDER BY SUM(c.send+c.recv) DESC"
             );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut out = String::from("label,send,recv,flows\n");
-            stmt.query_map(params![from_ts], |r| {
-                Ok(format!("{},{},{},{}\n",
-                    r.get::<_,String>(0).unwrap_or_default(),
-                    r.get::<_,i64>(1).unwrap_or(0),
-                    r.get::<_,i64>(2).unwrap_or(0),
-                    r.get::<_,i64>(3).unwrap_or(0),
-                ))
-            })?.filter_map(|r| r.ok()).for_each(|line| out.push_str(&line));
-            Ok(out)
-        })()
-    }).await.unwrap_or(Ok(String::new())).unwrap_or_default();
+                let mut stmt = conn.prepare(&sql)?;
+                let mut out = String::from("label,send,recv,flows\n");
+                let lines = collect_rows(stmt.query_map(params![from_ts, to_ts], |r| {
+                    let label: String = r.get(0)?;
+                    let send: i64 = r.get(1)?;
+                    let recv: i64 = r.get(2)?;
+                    let flows: i64 = r.get(3)?;
+                    Ok(format!("{label},{send},{recv},{flows}\n"))
+                })?)?;
+                lines.into_iter().for_each(|line| out.push_str(&line));
+                Ok(out)
+            })()
+        }),
+        "export_query_failed",
+    )
+    .await?;
 
-    (
+    Ok((
         [
             ("Content-Type", "text/csv"),
-            ("Content-Disposition", "attachment; filename=\"peekd-export.csv\""),
+            (
+                "Content-Disposition",
+                "attachment; filename=\"peekd-export.csv\"",
+            ),
         ],
         csv,
-    )
+    ))
 }
 
 async fn api_config(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -712,39 +865,111 @@ async fn api_config(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 pub async fn serve(cfg: crate::config::WebConfig) -> Result<()> {
     let state = AppState {
-        top_limit:       cfg.top_limit,
+        top_limit: cfg.top_limit.min(MAX_WEB_TOP_LIMIT),
         refresh_seconds: cfg.refresh_seconds,
-        default_since:   cfg.default_since.clone(),
+        default_since: cfg.default_since.clone(),
     };
 
     let api = Router::new()
-        .route("/config",      get(api_config))
-        .route("/data",        get(api_data))
-        .route("/top",         get(api_top))
-        .route("/summary",     get(api_summary))
-        .route("/alerts",      get(api_alerts))
+        .route("/config", get(api_config))
+        .route("/data", get(api_data))
+        .route("/top", get(api_top))
+        .route("/summary", get(api_summary))
+        .route("/alerts", get(api_alerts))
         .route("/connections", get(api_connections))
-        .route("/timeseries",  get(api_timeseries))
-        .route("/ignore",      post(api_ignore))
-        .route("/export",      get(api_export))
+        .route("/timeseries", get(api_timeseries))
+        .route("/ignore", post(api_ignore))
+        .route("/export", get(api_export))
         .with_state(state);
 
     // Check if static_dir should be used
-    let app: Router;
-    if !cfg.static_dir.is_empty() && std::path::Path::new(&cfg.static_dir).exists() {
-        use tower_http::services::ServeDir;
-        app = Router::new()
-            .nest("/api", api)
-            .fallback_service(ServeDir::new(&cfg.static_dir));
-    } else {
-        app = Router::new()
-            .route("/", get(|| async { Html(HTML) }))
-            .nest("/api", api);
-    }
+    let app: Router =
+        if !cfg.static_dir.is_empty() && std::path::Path::new(&cfg.static_dir).exists() {
+            use tower_http::services::ServeDir;
+            Router::new()
+                .nest("/api", api)
+                .fallback_service(ServeDir::new(&cfg.static_dir))
+        } else {
+            Router::new()
+                .route("/", get(|| async { Html(HTML) }))
+                .nest("/api", api)
+        };
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     println!("peekd web UI at http://localhost:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_web {
+    use super::*;
+
+    #[test]
+    fn explicit_from_to_is_preserved() {
+        assert_eq!(get_from_to(Some("24h"), Some(10), Some(20)), (10, 20));
+    }
+
+    #[test]
+    fn limit_zero_is_all_and_nonzero_is_clamped() {
+        assert_eq!(clamp_limit(0, 100), None);
+        assert_eq!(clamp_limit(1, 100), Some(1));
+        assert_eq!(clamp_limit(500, 100), Some(100));
+        assert_eq!(limit_sql(None), "");
+        assert_eq!(limit_sql(Some(10)), " LIMIT 10");
+    }
+
+    #[test]
+    fn web_errors_use_operator_envelope() {
+        let err = operator_error("invalid_ignore_kind", "invalid kind");
+
+        assert_eq!(err["ok"], false);
+        assert_eq!(err["error"]["code"], "invalid_ignore_kind");
+        assert_eq!(err["error"]["message"], "invalid kind");
+    }
+
+    #[test]
+    fn web_error_envelope_contains_code_and_message() {
+        let (status, Json(body)) = web_error("data_query_failed", "no such table: connections");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "data_query_failed");
+        assert_eq!(body["error"]["message"], "no such table: connections");
+    }
+
+    #[test]
+    fn dashboard_fetches_through_error_aware_helper() {
+        assert!(HTML.contains("async function fetchJson(url)"));
+        assert!(HTML.contains("apiErrorMessage(payload, response)"));
+        assert!(HTML.contains("expectArray(d, 'rows', '/api/data')"));
+        assert!(HTML.contains("expectArray(d, 'dests', '/api/top')"));
+        assert!(HTML.contains("Array.isArray(dest.subs) ? dest.subs : []"));
+        assert!(HTML.contains("expectArray(d, 'events', '/api/alerts')"));
+        assert!(HTML.contains("expectArray(d, 'connections', '/api/connections')"));
+        assert!(HTML.contains("expectArray(d, 'series', '/api/timeseries')"));
+        assert!(HTML.contains("expectArray(d, 'buckets', '/api/timeseries')"));
+        assert!(!HTML.contains("d.rows.slice(0, 15)"));
+    }
+
+    #[test]
+    fn collect_rows_fails_on_row_error() {
+        let rows: Vec<rusqlite::Result<i64>> = vec![Ok(1), Err(rusqlite::Error::InvalidQuery)];
+
+        assert!(collect_rows(rows).is_err());
+    }
+
+    #[tokio::test]
+    async fn api_ignore_rejects_invalid_kind_with_400() {
+        let (status, Json(body)) = api_ignore(axum::Json(IgnoreReq {
+            kind: "bad".to_string(),
+            value: "value".to_string(),
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_ignore_kind");
+    }
 }

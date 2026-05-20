@@ -9,12 +9,12 @@
 //!
 //! Populates connections_meta table with connect_t, close_t, direction.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::net::IpAddr;
-use tokio::sync::{Mutex, broadcast};
 use crate::config::Config;
 use crate::metrics::Metrics;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Arc;
+use tokio::sync::broadcast;
 
 /// Direction of a TCP connection.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,7 +88,9 @@ impl ConnectionTracker {
     pub fn on_connect(&mut self, event: ConnectEvent) -> Option<LifecycleRecord> {
         if self.active.len() >= MAX_ACTIVE_CONNECTIONS {
             // Evict oldest by timestamp
-            if let Some(oldest_key) = self.active.iter()
+            if let Some(oldest_key) = self
+                .active
+                .iter()
                 .min_by_key(|(_, v)| v.timestamp)
                 .map(|(k, _)| k.clone())
             {
@@ -158,49 +160,55 @@ pub struct LifecycleRecord {
     pub direction: Direction,
 }
 
-/// Write lifecycle records to SQLite connections_meta table.
-pub async fn write_meta(
-    mut rx: tokio::sync::mpsc::Receiver<LifecycleRecord>,
-    db: Arc<Mutex<rusqlite::Connection>>,
-) {
-    while let Some(record) = rx.recv().await {
-        let db = db.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let conn = db.blocking_lock();
-            conn.execute(
-                "INSERT INTO connections_meta (exe, laddr, lport, raddr, rport, connect_t, close_t, direction)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![
-                    record.exe,
-                    record.laddr.to_string(),
-                    record.lport,
-                    record.raddr.to_string(),
-                    record.rport,
-                    record.connect_t,
-                    record.close_t,
-                    record.direction.as_str(),
-                ],
-            )
-        })
-        .await;
-    }
-}
+#[cfg(test)]
+mod tests_connection_lifecycle {
+    use super::*;
 
-/// Create the connections_meta table if it doesn't exist.
-pub fn create_table(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS connections_meta (
-            id         INTEGER PRIMARY KEY,
-            exe        TEXT NOT NULL,
-            laddr      TEXT NOT NULL,
-            lport      INTEGER NOT NULL,
-            raddr      TEXT NOT NULL,
-            rport      INTEGER NOT NULL,
-            connect_t  INTEGER NOT NULL,
-            close_t    INTEGER,
-            direction  TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_meta_connect_t ON connections_meta(connect_t);
-        CREATE INDEX IF NOT EXISTS idx_meta_raddr ON connections_meta(raddr);"
-    )
+    fn event(event_type: ConnectEventType, timestamp: i64) -> ConnectEvent {
+        ConnectEvent {
+            pid: 100,
+            ppid: 1,
+            uid: 1000,
+            exe: "/usr/bin/curl".to_string(),
+            laddr: "127.0.0.1".parse().unwrap(),
+            lport: 40000,
+            raddr: "1.2.3.4".parse().unwrap(),
+            rport: 443,
+            direction: Direction::Outbound,
+            event_type,
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn close_event_emits_lifecycle_record() {
+        let metrics = Arc::new(Metrics::default());
+        let mut tracker = ConnectionTracker::new(metrics);
+
+        assert!(tracker
+            .on_connect(event(ConnectEventType::Connect, 10))
+            .is_none());
+        let record = tracker
+            .on_close(event(ConnectEventType::Close, 20))
+            .unwrap();
+
+        assert_eq!(record.exe, "/usr/bin/curl");
+        assert_eq!(record.connect_t, 10);
+        assert_eq!(record.close_t, Some(20));
+        assert_eq!(record.direction, Direction::Outbound);
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn close_without_connect_emits_unknown_connect_time() {
+        let metrics = Arc::new(Metrics::default());
+        let mut tracker = ConnectionTracker::new(metrics);
+
+        let record = tracker
+            .on_close(event(ConnectEventType::Close, 20))
+            .unwrap();
+
+        assert_eq!(record.connect_t, 0);
+        assert_eq!(record.close_t, Some(20));
+    }
 }

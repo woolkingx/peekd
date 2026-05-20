@@ -11,32 +11,17 @@
 //! Async daemon that wires all modules into a streaming pipeline:
 //! BPF → resolver → filter → hasher → broadcast → [storage, alerts, state]
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
-use tokio::sync::{Mutex, broadcast};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::{info, warn, error};
-
-mod bpf;
-mod report;
-mod web;
-mod resolver;
-mod fd_cache;
-mod dns;
-mod hasher;
-mod filter;
-mod storage;
-mod state;
-mod notify;
-mod query;
-mod alerts;
-mod metrics;
-mod fuse;
-mod types;
-mod config;
-mod connection_lifecycle;
+use peekd::{
+    alerts, bpf, config, connection_lifecycle, dns, domain, fd_cache, filter, fuse, hasher,
+    logging, metrics, notify, query, report, resolver, state, storage, types, web,
+};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{broadcast, Mutex};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "peekd", about = "Per-process network attribution daemon")]
@@ -113,6 +98,21 @@ enum Commands {
         #[arg(long)]
         sum_bytes: bool,
     },
+    /// Print daemon status from /run/peekd/metrics.json
+    Status,
+    /// Database maintenance commands
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Run SQLite integrity_check
+    Check,
+    /// Run WAL checkpoint TRUNCATE
+    Checkpoint,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -121,7 +121,8 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Web { port }) => {
-            let mut cfg = config::load().map_err(|e| anyhow::anyhow!("{}", e))
+            let mut cfg = config::load()
+                .map_err(|e| anyhow::anyhow!("{}", e))
                 .map(|c| c.web)
                 .unwrap_or_default();
             cfg.port = port;
@@ -132,13 +133,59 @@ async fn main() -> anyhow::Result<()> {
             let args = report::ReportArgs { since, top, json };
             return report::run_report(&args, &config);
         }
-        Some(Commands::Query { exe, name, domain, raddr, rport, lport, uid, sha256, since, limit, json, count, sum_bytes }) => {
+        Some(Commands::Query {
+            exe,
+            name,
+            domain,
+            raddr,
+            rport,
+            lport,
+            uid,
+            sha256,
+            since,
+            limit,
+            json,
+            count,
+            sum_bytes,
+        }) => {
             let config = config::load().map_err(|e| anyhow::anyhow!("{}", e))?;
             let args = query::QueryArgs {
-                exe, name, domain, raddr, rport, lport, uid, sha256,
-                since, limit, json, count, sum_bytes,
+                exe,
+                name,
+                domain,
+                raddr,
+                rport,
+                lport,
+                uid,
+                sha256,
+                since,
+                limit,
+                json,
+                count,
+                sum_bytes,
             };
             return query::query_cli(&args, &config);
+        }
+        Some(Commands::Status) => {
+            return metrics::status_cli();
+        }
+        Some(Commands::Db { command }) => {
+            match command {
+                DbCommand::Check => {
+                    let result =
+                        storage::integrity_check().map_err(|e| anyhow::anyhow!("{}", e))?;
+                    println!("{result}");
+                }
+                DbCommand::Checkpoint => {
+                    let status =
+                        storage::checkpoint_truncate().map_err(|e| anyhow::anyhow!("{}", e))?;
+                    println!(
+                        "busy={} log_frames={} checkpointed_frames={}",
+                        status.busy, status.log_frames, status.checkpointed_frames
+                    );
+                }
+            }
+            return Ok(());
         }
         Some(Commands::Daemon { .. }) | None => {
             // Fall through to daemon mode
@@ -161,20 +208,12 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(config::data_dir());
     let _ = std::fs::create_dir_all(config::log_dir());
 
-    // Initialize structured logging → /var/log/peekd/peekd.YYYY-MM-DD.log
-    let file_appender = tracing_appender::rolling::daily(config::log_dir(), "peekd.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(non_blocking)
-        .init();
+    let _log_guard = logging::init(config::log_dir());
 
     // DNS map: shared LRU cache for IP → domain resolution
     let dns_map_inner = dns::new_dns_map(10_000);
     let dns_map = Arc::new(dns_map_inner.clone());
+    let domain_evidence_store = domain::new_domain_store(10_000);
 
     // fanotify for executable modification tracking
     let fan_fd = match bpf::init_fanotify() {
@@ -223,18 +262,39 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
-            let total = metrics_clone.events_total.load(std::sync::atomic::Ordering::Relaxed);
-            let dropped = metrics_clone.events_dropped.load(std::sync::atomic::Ordering::Relaxed);
-            let filtered = metrics_clone.events_filtered.load(std::sync::atomic::Ordering::Relaxed);
-            let sendv4 = metrics_clone.events_sendv4.load(std::sync::atomic::Ordering::Relaxed);
-            let recvv4 = metrics_clone.events_recvv4.load(std::sync::atomic::Ordering::Relaxed);
-            let exec = metrics_clone.events_exec.load(std::sync::atomic::Ordering::Relaxed);
-            let dns = metrics_clone.events_dns.load(std::sync::atomic::Ordering::Relaxed);
-            let alerts = metrics_clone.alerts_fired.load(std::sync::atomic::Ordering::Relaxed);
-            let writes = metrics_clone.sqlite_writes.load(std::sync::atomic::Ordering::Relaxed);
+            let total = metrics_clone
+                .events_total
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dropped = metrics_clone
+                .events_dropped
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let filtered = metrics_clone
+                .events_filtered
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let sendv4 = metrics_clone
+                .events_sendv4
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let recvv4 = metrics_clone
+                .events_recvv4
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let exec = metrics_clone
+                .events_exec
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dns = metrics_clone
+                .events_dns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let new_hash = metrics_clone
+                .new_hash_detected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let alerts = metrics_clone
+                .alerts_fired
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let writes = metrics_clone
+                .sqlite_writes
+                .load(std::sync::atomic::Ordering::Relaxed);
             info!(
-                "pipeline: total={} sendv4={} recvv4={} exec={} dns={} filtered={} dropped={} alerts={} writes={}",
-                total, sendv4, recvv4, exec, dns, filtered, dropped, alerts, writes
+                "pipeline: total={} sendv4={} recvv4={} exec={} dns={} filtered={} dropped={} new_hash={} alerts={} writes={}",
+                total, sendv4, recvv4, exec, dns, filtered, dropped, new_hash, alerts, writes
             );
         }
     });
@@ -243,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
     let config_clone = config.clone();
     let metrics_clone = metrics.clone();
     tokio::spawn(async move {
-        if let Err(e) = query::serve(config_clone, metrics_clone).await {
+        if let Err(e) = query::serve(config_clone, metrics_clone, start_time).await {
             error!("query serve error: {}", e);
         }
     });
@@ -251,7 +311,10 @@ async fn main() -> anyhow::Result<()> {
     // 3b. Web dashboard (optional)
     {
         let mut web_cfg = config.web.clone();
-        if let Some(p) = web_port { web_cfg.port = p; web_cfg.enabled = true; }
+        if let Some(p) = web_port {
+            web_cfg.port = p;
+            web_cfg.enabled = true;
+        }
         if web_cfg.enabled && web_cfg.port > 0 {
             tokio::spawn(async move {
                 if let Err(e) = web::serve(web_cfg).await {
@@ -262,84 +325,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 4. BPF event source
-    let raw_tx = bpf::events(metrics.clone()).await?;
-
-    // 4b. Connection lifecycle tracker (v2)
-    {
-        let db_path = config::db_path();
-        let lifecycle_db = rusqlite::Connection::open(&db_path)
-            .map_err(|e| anyhow::anyhow!("failed to open db for connection_lifecycle: {}", e))?;
-        lifecycle_db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|e| anyhow::anyhow!("failed to set WAL mode for lifecycle db: {}", e))?;
-        connection_lifecycle::create_table(&lifecycle_db)
-            .map_err(|e| anyhow::anyhow!("failed to create connections_meta table: {}", e))?;
-        let lifecycle_db = Arc::new(Mutex::new(lifecycle_db));
-
-        let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(1024);
-        let lifecycle_db_clone = lifecycle_db.clone();
-        tokio::spawn(async move {
-            connection_lifecycle::write_meta(lifecycle_rx, lifecycle_db_clone).await;
-        });
-
-        let raw_rx_lifecycle = raw_tx.subscribe();
-        let metrics_clone = metrics.clone();
-        let metrics_lifecycle = metrics.clone();
-        tokio::spawn(async move {
-            let mut rx = raw_rx_lifecycle;
-            let mut tracker = connection_lifecycle::ConnectionTracker::new(metrics_clone);
-            loop {
-                match rx.recv().await {
-                    Ok(types::RawEvent::Connect(raw)) => {
-                        use std::net::{IpAddr, Ipv4Addr};
-                        let event = connection_lifecycle::ConnectEvent {
-                            pid: raw.pid,
-                            ppid: raw.ppid,
-                            uid: raw.uid,
-                            exe: String::from_utf8_lossy(&raw.comm).trim_end_matches('\0').to_string(),
-                            laddr: IpAddr::V4(Ipv4Addr::from(raw.saddr.swap_bytes())),
-                            lport: raw.sport,
-                            raddr: IpAddr::V4(Ipv4Addr::from(raw.daddr.swap_bytes())),
-                            rport: raw.dport,
-                            direction: if raw.direction == 0 {
-                                connection_lifecycle::Direction::Outbound
-                            } else {
-                                connection_lifecycle::Direction::Inbound
-                            },
-                            event_type: if raw.event_type == 0 {
-                                connection_lifecycle::ConnectEventType::Connect
-                            } else {
-                                connection_lifecycle::ConnectEventType::Close
-                            },
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as i64,
-                        };
-                        let record = match event.event_type {
-                            connection_lifecycle::ConnectEventType::Connect => tracker.on_connect(event),
-                            connection_lifecycle::ConnectEventType::Close => tracker.on_close(event),
-                        };
-                        if let Some(record) = record {
-                            let _ = lifecycle_tx.send(record).await;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("lifecycle task lagged, dropping {} events", n);
-                        metrics_lifecycle.events_dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    let raw_tx = bpf::events(metrics.clone(), config.monitoring.perf_ring_buffer_pages).await?;
 
     // 5. DNS update task (consumes RawEvent::Dns variants)
     let raw_rx_dns = raw_tx.subscribe();
     let dns_map_inner_clone = dns_map_inner.clone();
+    let domain_evidence_store_clone = domain_evidence_store.clone();
     let metrics_clone = metrics.clone();
     tokio::spawn(async move {
-        dns::run(raw_rx_dns, dns_map_inner_clone, metrics_clone).await;
+        dns::run(
+            raw_rx_dns,
+            dns_map_inner_clone,
+            domain_evidence_store_clone,
+            metrics_clone,
+        )
+        .await;
     });
 
     // 6. Resolver task (RawEvent → BpfEvent)
@@ -348,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
     let fd_cache_clone = fd_cache.clone();
     let dns_map_clone = dns_map.clone();
     let config_clone = config.clone();
+    let domain_router = domain::DomainRouter::new(domain_evidence_store.clone());
     let metrics_clone = metrics.clone();
     let resolved_tx_clone = resolved_tx.clone();
     tokio::spawn(async move {
@@ -357,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
             fd_cache_clone,
             dns_map_clone,
             config_clone,
+            domain_router,
             metrics_clone,
         )
         .await;
@@ -382,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
     let config_clone = config.clone();
     let hashed_tx_clone = hashed_tx.clone();
     let fd_cache_clone = fd_cache.clone();
-    let _metrics_clone = metrics.clone();
+    let metrics_clone = metrics.clone();
     tokio::spawn(async move {
         hasher::run(
             resolved_rx_hasher,
@@ -390,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
             config_clone,
             Some(fuse_tx),
             fd_cache_clone,
+            metrics_clone,
         )
         .await;
     });
@@ -402,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
     // while alerts/storage have already received the original with is_new_hash=false.
     let (filtered_tx, _) = broadcast::channel(config.broadcast.channel_capacity);
     let hashed_rx_filter = hashed_tx.subscribe();
-    let filter_chain = filter::new_chain(&config);
+    let filter_chain = filter::new_chain_with_extra(&config, &config::config_dir());
     let filter_chain_reload = filter_chain.clone();
     let filtered_tx_clone = filtered_tx.clone();
     let metrics_enrich = metrics.clone();
@@ -440,7 +443,8 @@ async fn main() -> anyhow::Result<()> {
                         // NEW_EXE: exe path never seen before (normal — software install/first run)
                         // NEW_HASH: new sha256 for known exe (suspicious — possible tampering)
                         if !event.exe.is_empty() {
-                            let is_new_exe = exe_seen_set_enrich.read()
+                            let is_new_exe = exe_seen_set_enrich
+                                .read()
                                 .map(|s| !s.contains(&event.exe))
                                 .unwrap_or(false);
                             if is_new_exe {
@@ -448,17 +452,28 @@ async fn main() -> anyhow::Result<()> {
                             }
                             if !event.sha256.is_empty() && !event.sha256.starts_with("!!!") {
                                 let key = (event.exe.clone(), event.sha256.clone());
-                                let is_new_hash = seen_set_enrich.read()
+                                let is_new_hash = seen_set_enrich
+                                    .read()
                                     .map(|s| !s.contains(&key))
                                     .unwrap_or(false);
                                 if is_new_hash {
                                     event.meta.set_new_hash();
-                                    metrics_enrich.alerts_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    metrics_enrich
+                                        .new_hash_detected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     info!("new hash: {} for {}", event.sha256, event.exe);
-                                    let _ = notify_tx.send(types::NotifyMsg::NewHash {
-                                        exe: event.exe.clone(),
-                                        sha256: event.sha256.clone(),
-                                    }).await;
+                                    if notify_tx
+                                        .try_send(types::NotifyMsg::NewHash {
+                                            exe: event.exe.clone(),
+                                            sha256: event.sha256.clone(),
+                                        })
+                                        .is_err()
+                                    {
+                                        metrics_enrich
+                                            .events_dropped
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        warn!("notify channel full, new hash notification dropped");
+                                    }
                                 }
                             }
                         }
@@ -466,14 +481,19 @@ async fn main() -> anyhow::Result<()> {
                         // Forward to state task for full AppState update (non-blocking).
                         // try_send drops when channel full (state task lagged); log and count.
                         if state_event_tx.try_send(event).is_err() {
-                            metrics_enrich.events_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics_enrich
+                                .events_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics_enrich
+                                .state_queue_drops
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!("state channel full, exe tracking dropped for one event");
                         }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("filter lagged, dropping {} events", n);
-                    metrics_enrich.events_dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    metrics_enrich.record_broadcast_lag("filter", n);
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -484,16 +504,82 @@ async fn main() -> anyhow::Result<()> {
     let filtered_rx_storage = filtered_tx.subscribe();
     let config_clone = config.clone();
     let metrics_storage = metrics.clone();
-    let writer_tx_storage = tokio::spawn(async move {
-        match storage::run(filtered_rx_storage, config_clone, metrics_storage).await {
-            Ok(tx) => Some(tx),
-            Err(e) => {
-                error!("storage error: {}", e);
-                None
+    let storage_handle = storage::start(filtered_rx_storage, config_clone, metrics_storage)
+        .map_err(|e| anyhow::anyhow!("storage error: {}", e))?;
+    let writer_tx = storage_handle.alert_sender();
+
+    // 9b. Connection lifecycle tracker. Storage owns SQLite writes.
+    {
+        let lifecycle_tx = writer_tx.clone();
+        let raw_rx_lifecycle = raw_tx.subscribe();
+        let metrics_clone = metrics.clone();
+        let metrics_lifecycle = metrics.clone();
+        tokio::spawn(async move {
+            let mut rx = raw_rx_lifecycle;
+            let mut tracker = connection_lifecycle::ConnectionTracker::new(metrics_clone);
+            loop {
+                match rx.recv().await {
+                    Ok(types::RawEvent::Connect(raw)) => {
+                        use std::net::{IpAddr, Ipv4Addr};
+                        let event = connection_lifecycle::ConnectEvent {
+                            pid: raw.pid,
+                            ppid: raw.ppid,
+                            uid: raw.uid,
+                            exe: String::from_utf8_lossy(&raw.comm)
+                                .trim_end_matches('\0')
+                                .to_string(),
+                            laddr: IpAddr::V4(Ipv4Addr::from(raw.saddr.swap_bytes())),
+                            lport: raw.sport,
+                            raddr: IpAddr::V4(Ipv4Addr::from(raw.daddr.swap_bytes())),
+                            rport: raw.dport,
+                            direction: if raw.direction == 0 {
+                                connection_lifecycle::Direction::Outbound
+                            } else {
+                                connection_lifecycle::Direction::Inbound
+                            },
+                            event_type: if raw.event_type == 0 {
+                                connection_lifecycle::ConnectEventType::Connect
+                            } else {
+                                connection_lifecycle::ConnectEventType::Close
+                            },
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64,
+                        };
+                        let record = match event.event_type {
+                            connection_lifecycle::ConnectEventType::Connect => {
+                                tracker.on_connect(event)
+                            }
+                            connection_lifecycle::ConnectEventType::Close => {
+                                tracker.on_close(event)
+                            }
+                        };
+                        if let Some(record) = record {
+                            if lifecycle_tx
+                                .send(storage::WriterMsg::LifecycleRecord(record))
+                                .is_err()
+                            {
+                                metrics_lifecycle
+                                    .events_dropped
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                metrics_lifecycle
+                                    .lifecycle_queue_drops
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                warn!("storage writer closed, connection metadata dropped");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("lifecycle task lagged, dropping {} events", n);
+                        metrics_lifecycle.record_broadcast_lag("lifecycle", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-        }
-    });
-    let writer_tx = writer_tx_storage.await.ok().flatten().unwrap();
+        });
+    }
 
     // 10. Alerts task (hot-reloadable via Arc<RwLock<>>)
     let filtered_rx_alerts = filtered_tx.subscribe();
@@ -503,7 +589,14 @@ async fn main() -> anyhow::Result<()> {
     let metrics_alerts = metrics.clone();
     let writer_tx_alerts = writer_tx.clone();
     tokio::spawn(async move {
-        alerts::run(filtered_rx_alerts, config_clone, alerts_rules, metrics_alerts, writer_tx_alerts).await;
+        alerts::run(
+            filtered_rx_alerts,
+            config_clone,
+            alerts_rules,
+            metrics_alerts,
+            writer_tx_alerts,
+        )
+        .await;
     });
 
     // 12. State flush task (periodic flush every 30s)
@@ -518,21 +611,25 @@ async fn main() -> anyhow::Result<()> {
     // 13. SIGHUP handler (hot reload config, filters, and alert rules)
     let filter_chain_sighup = filter_chain_reload.clone();
     tokio::spawn(async move {
-        let mut sighup = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::hangup(),
-        ) {
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
             Ok(s) => s,
-            Err(e) => { error!("failed to register SIGHUP handler: {}", e); return; }
+            Err(e) => {
+                error!("failed to register SIGHUP handler: {}", e);
+                return;
+            }
         };
         loop {
             sighup.recv().await;
             info!("SIGHUP received, reloading config");
             match config::load() {
                 Ok(new_config) => {
-                    let new_filters = filter::build(&new_config);
+                    let new_filters = filter::build_with_extra(&new_config, &config::config_dir());
                     *filter_chain_sighup.write().unwrap() = new_filters;
-                    info!("config reloaded, {} filters active",
-                        filter_chain_sighup.read().unwrap().len());
+                    info!(
+                        "config reloaded, {} filters active",
+                        filter_chain_sighup.read().unwrap().len()
+                    );
                 }
                 Err(e) => error!("config reload failed: {}", e),
             }
@@ -570,5 +667,6 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 
+    storage_handle.shutdown().await;
     Ok(())
 }

@@ -6,9 +6,9 @@
 //! Feature-gated: compile with `--features notifications` to enable.
 //! When disabled, run() drains the channel (no-op).
 
-use std::sync::Arc;
 use crate::config::Config;
 use crate::types::NotifyMsg;
+use std::sync::Arc;
 
 /// Drop root privileges permanently to the specified user.
 ///
@@ -53,10 +53,7 @@ fn _drop_root(user: &str) {
 /// Drops root, then listens for NotifyMsg and sends D-Bus notifications.
 /// Dedup: skip if identical to last message sent.
 #[cfg(feature = "notifications")]
-pub async fn run(
-    mut notify_rx: tokio::sync::mpsc::Receiver<NotifyMsg>,
-    config: Arc<Config>,
-) {
+pub async fn run(mut notify_rx: tokio::sync::mpsc::Receiver<NotifyMsg>, config: Arc<Config>) {
     if !config.desktop.user.is_empty() {
         _drop_root(&config.desktop.user);
     }
@@ -65,15 +62,15 @@ pub async fn run(
 
     while let Some(msg) = notify_rx.recv().await {
         let (summary, body) = match &msg {
-            NotifyMsg::NewExe { pid, exe, cmdline } => {
-                ("peekd: New executable".into(), format!("[pid {}] {} ({})", pid, exe, cmdline))
-            }
-            NotifyMsg::NewHash { exe, sha256 } => {
-                ("peekd: Hash changed".into(), format!("Binary modified: {} ({})", exe, sha256))
-            }
-            NotifyMsg::Error { msg } => {
-                ("peekd: Error".into(), msg.clone())
-            }
+            NotifyMsg::NewExe { pid, exe, cmdline } => (
+                "peekd: New executable".into(),
+                format!("[pid {}] {} ({})", pid, exe, cmdline),
+            ),
+            NotifyMsg::NewHash { exe, sha256 } => (
+                "peekd: Hash changed".into(),
+                format!("Binary modified: {} ({})", exe, sha256),
+            ),
+            NotifyMsg::Error { msg } => ("peekd: Error".into(), msg.clone()),
         };
 
         let key = format!("{}:{}", summary, body);
@@ -100,9 +97,6 @@ pub async fn run(
 /// No-op stub when notifications feature is disabled.
 /// Drains channel to prevent backpressure.
 #[cfg(not(feature = "notifications"))]
-pub async fn run(
-    mut notify_rx: tokio::sync::mpsc::Receiver<NotifyMsg>,
-    _config: Arc<Config>,
-) {
+pub async fn run(mut notify_rx: tokio::sync::mpsc::Receiver<NotifyMsg>, _config: Arc<Config>) {
     while let Some(_msg) = notify_rx.recv().await {}
 }

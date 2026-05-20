@@ -9,15 +9,15 @@
 //! mod_cnt from fanotify invalidation counter forces cache miss on file modification.
 
 use crate::config::Config;
-use crate::types::BpfEvent;
 use crate::fuse::FuseRequest;
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use crate::types::BpfEvent;
 use lru::LruCache;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Hasher: SHA256 computation with LRU cache and fallback chain.
 pub struct Hasher {
@@ -47,20 +47,15 @@ impl Hasher {
             return hash.clone();
         }
 
-        // Fallback 1: Try fd read
-        if !event.fd_path.is_empty() {
-            if let Some(hash) = _get_sha256_fd(&event.fd_path, event.dev, event.ino) {
-                self.cache.put(key, hash.clone());
-                return hash;
-            }
-        }
-
-        // Fallback 2: Try pid read
-        if event.pid > 0 {
-            if let Some(hash) = _get_sha256_pid(event.pid, event.dev, event.ino) {
-                self.cache.put(key, hash.clone());
-                return hash;
-            }
+        let fd_path = event.fd_path.clone();
+        let pid = event.pid;
+        let dev = event.dev;
+        let ino = event.ino;
+        if let Ok(Some(hash)) =
+            tokio::task::spawn_blocking(move || _get_sha256_local(&fd_path, pid, dev, ino)).await
+        {
+            self.cache.put(key, hash.clone());
+            return hash;
         }
 
         // Fallback 3: Try fuse worker
@@ -97,6 +92,18 @@ impl Hasher {
             _ => None,
         }
     }
+}
+
+fn _get_sha256_local(fd_path: &str, pid: u32, dev: u64, ino: u64) -> Option<String> {
+    if !fd_path.is_empty() {
+        if let Some(hash) = _get_sha256_fd(fd_path, dev, ino) {
+            return Some(hash);
+        }
+    }
+    if pid > 0 {
+        return _get_sha256_pid(pid, dev, ino);
+    }
+    None
 }
 
 /// Try read via /proc/{pid}/fd/{n}, verify inode matches.
@@ -175,6 +182,7 @@ pub async fn run(
     config: Arc<Config>,
     fuse_tx: Option<mpsc::Sender<FuseRequest>>,
     fd_cache: Arc<tokio::sync::Mutex<crate::fd_cache::FdCache>>,
+    metrics: Arc<crate::metrics::Metrics>,
 ) {
     let mut hasher = Hasher::new(config, fuse_tx);
 
@@ -183,7 +191,10 @@ pub async fn run(
             Ok(mut event) => {
                 let mod_cnt = {
                     let mut cache = fd_cache.lock().await;
-                    cache.get(event.dev, event.ino).map(|(_, cnt)| cnt).unwrap_or(0)
+                    cache
+                        .get(event.dev, event.ino)
+                        .map(|(_, cnt)| cnt)
+                        .unwrap_or(0)
                 };
 
                 event.sha256 = hasher.hash(&event, mod_cnt).await;
@@ -193,8 +204,9 @@ pub async fn run(
                     tracing::error!("hasher broadcast failed: {}", e);
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // Receiver lagged, skip
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("hasher lagged, dropping {} events", n);
+                metrics.record_broadcast_lag("hasher", n);
             }
             Err(broadcast::error::RecvError::Closed) => {
                 break;
@@ -205,7 +217,11 @@ pub async fn run(
 
 /// Helper: hash parent process exe using parent's own mod_cnt from fd_cache.
 impl Hasher {
-    async fn hash_parent(&mut self, event: &BpfEvent, fd_cache: &Arc<tokio::sync::Mutex<crate::fd_cache::FdCache>>) -> String {
+    async fn hash_parent(
+        &mut self,
+        event: &BpfEvent,
+        fd_cache: &Arc<tokio::sync::Mutex<crate::fd_cache::FdCache>>,
+    ) -> String {
         // G-5: zero pdev/pino means parent info unavailable — all such events would share
         // cache key (0,0,0) and return the same wrong hash. Return empty string instead.
         if event.pdev == 0 && event.pino == 0 {
@@ -214,7 +230,10 @@ impl Hasher {
 
         let parent_mod_cnt = {
             let mut cache = fd_cache.lock().await;
-            cache.get(event.pdev, event.pino).map(|(_, cnt)| cnt).unwrap_or(0)
+            cache
+                .get(event.pdev, event.pino)
+                .map(|(_, cnt)| cnt)
+                .unwrap_or(0)
         };
 
         let mut parent_event = event.clone();
@@ -225,5 +244,31 @@ impl Hasher {
         parent_event.pid = event.ppid;
 
         self.hash(&parent_event, parent_mod_cnt).await
+    }
+}
+
+#[cfg(test)]
+mod tests_hasher {
+    use super::*;
+
+    #[test]
+    fn local_hash_reads_matching_fd() {
+        let path = std::env::temp_dir().join(format!("peekd-hasher-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let file = File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let hash = _get_sha256_local(
+            path.to_str().unwrap(),
+            0,
+            _stat_dev(&metadata),
+            _stat_ino(&metadata),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

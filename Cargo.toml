@@ -1,14 +1,13 @@
 [workspace]
 members = ["peekd", "peekd-common", "xtask"]
-exclude = ["peekd-ebpf"]
 resolver = "2"
 
 [workspace.dependencies]
-aya = { git = "https://github.com/aya-rs/aya", branch = "main" }
-aya-log = { git = "https://github.com/aya-rs/aya", branch = "main" }
 tokio = { version = "1", features = ["full"] }
 async-stream = "0.3"
 futures = "0.3"
+libbpf-rs = "0.26"
+libbpf-cargo = "0.26"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
@@ -29,6 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 axum = "0.7"
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "991dd4b8dfd8c9d62ce8999521b24f61d9b7fc52" }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "peekd.domain",
+  "title": "DomainEvidence",
+  "type": "object",
+  "required": [
+    "addr",
+    "domain",
+    "source",
+    "confidence",
+    "status",
+    "observed_at",
+    "ambiguous"
+  ],
+  "properties": {
+    "addr": {
+      "type": "string",
+      "format": "ip"
+    },
+    "domain": {
+      "type": "string",
+      "description": "Canonical TLD-first domain, empty when unknown."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["dns_answer", "getaddrinfo", "mihomo_api", "sni", "ptr", "unknown"]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low", "none"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["direct_dns_seen", "proxy_ingress", "proxy_egress", "sni_seen", "ptr_only", "unknown"]
+    },
+    "observed_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expires_at": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "pid": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "process": {
+      "type": ["string", "null"]
+    },
+    "ambiguous": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}
