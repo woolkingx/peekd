@@ -1,16 +1,34 @@
 # peekd
 
-Lightweight Linux daemon for per-process network monitoring, alerting, and traffic reports — powered by eBPF.
+Linux eBPF/libbpf CO-RE daemon for per-process network attribution: domains,
+bytes, executable hashes, alerts, SQLite WAL storage, and a live web UI.
 
-Rewritten from [picosnitch](https://github.com/elesiuta/picosnitch) in Rust for performance and correctness.
+peekd answers the operator question: which executable talked to which domain or
+IP, how much traffic moved, and did the binary change? It observes kernel
+send/recv paths and DNS evidence, enriches each flow with process identity and
+hashes, stores history in SQLite, and exposes CLI, report, metrics, alerts, and
+dashboard views.
+
+Rewritten from [picosnitch](https://github.com/elesiuta/picosnitch) in Rust with
+a libbpf CO-RE eBPF adapter and a single-writer SQLite architecture.
+
+## At a glance
+
+| Layer | What peekd owns |
+|---|---|
+| Kernel capture | libbpf CO-RE probes for send/recv, lifecycle, exec, and resolver evidence |
+| Attribution | Process, parent process, domain source/confidence/status, bytes, ports, exe hashes |
+| Storage | SQLite WAL with one writer, query-only readers, retention, checkpoint and integrity commands |
+| Operator surface | Web dashboard, CLI query/report, metrics JSON, alerts, desktop notifications |
 
 ## What it does
 
-- Captures AF_INET/AF_INET6 send/recv via libbpf CO-RE kprobes on `inet_sendmsg` and `inet_recvmsg`
-- Tracks TCP connection lifecycle (connect, accept, close) via kprobe
-- Resolves DNS domains via uprobe on `getaddrinfo`
+- Attributes AF_INET/AF_INET6 send/recv bytes to executable path, process name, parent process, UID, endpoint, and domain evidence
+- Captures traffic via libbpf CO-RE probes on kernel send/recv paths
+- Tracks TCP connection lifecycle (connect, accept, close), exec, and process metadata
+- Resolves domains from DNS answers, resolver evidence, SNI/PTR hints, and proxy hints with source/confidence/status
 - Resolves exe paths, cmdlines, sha256 hashes per process
-- Stores connections to SQLite with configurable retention
+- Stores connections in SQLite WAL with one writer, query-only readers, retention, checkpoint, and integrity commands
 - Fires alerts (exec script or webhook) on configurable rules
 - Detects binary tampering: `NEW_HASH` flag when a known exe gets a new sha256
 - Exports runtime metrics to `/run/peekd/metrics.json`
